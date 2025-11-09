@@ -247,13 +247,15 @@ def load_pandas_dataset(
         dataset_metadata = metadata[name.lower()]
         all_by_files = parse_building_years_metadata(dataset_path, name.lower())
         all_by_files = [by_file for by_file in all_by_files if subset in by_file.lower()]
-        building_type = dataset_metadata[subset]['building_type']
-        building_latlon = dataset_metadata[subset]['latlon']
+        # FIX: Use .get() with default value to handle missing building_type
+        building_type = dataset_metadata[subset].get('building_type', BuildingTypes.RESIDENTIAL)
+        building_latlon = dataset_metadata[subset].get('latlon', [0.0, 0.0])
     else:
         dataset_metadata = metadata[name.lower()]
         all_by_files = parse_building_years_metadata(dataset_path, name.lower())
-        building_type = dataset_metadata['building_type']
-        building_latlon = dataset_metadata['latlon']
+        # FIX: Use .get() with default value to handle missing building_type
+        building_type = dataset_metadata.get('building_type', BuildingTypes.RESIDENTIAL)
+        building_latlon = dataset_metadata.get('latlon', [0.0, 0.0])
     if include_outliers:
         dataset_path = dataset_path / 'buildingsbench_with_outliers'
 
