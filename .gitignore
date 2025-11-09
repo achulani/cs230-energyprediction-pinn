@@ -1,7 +1,6 @@
 wandb/
 checkpoints/
 checkpoints.tar.gz
-results/
 site/
 *.egg-info/
 scripts/creating_buildings_bench/
