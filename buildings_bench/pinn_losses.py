@@ -1,0 +1,390 @@
+"""
+Physics-Informed Neural Network (PINN) Loss Functions for Building Energy Prediction.
+
+This module implements physics-constrained loss functions for residual learning,
+where a neural network corrects LightGBM predictions to satisfy thermodynamic constraints.
+
+The losses enforce:
+1. RC circuit energy balance (thermal dynamics)
+2. Comfort zone violations (indoor temperature bounds)
+3. Smoothness regularization (temporal consistency)
+"""
+
+import torch
+import torch.nn as nn
+import numpy as np
+from typing import Dict, Optional, Tuple
+
+
+def extract_building_params(metadata: Dict) -> Tuple[float, float, float, float, float]:
+    """Extract building physics parameters from metadata dictionary.
+    
+    Args:
+        metadata: Dictionary containing building metadata with keys:
+            - 'in.sqft': Building square footage
+            - 'stat.average_dx_cooling_cop': Average cooling COP (optional)
+            - 'in.tstat_clg_sp_f': Cooling setpoint in Fahrenheit (optional)
+    
+    Returns:
+        Tuple of (C, R, hvac_eff, T_set, deltaT):
+            - C: Thermal capacitance proxy (J/K)
+            - R: Envelope resistance proxy (K/W)
+            - hvac_eff: HVAC efficiency (COP)
+            - T_set: Comfort setpoint in Celsius
+            - deltaT: Comfort band in Celsius
+    """
+    # Thermal capacitance proxy: scales with building size
+    sqft = metadata.get("in.sqft", 2000.0)
+    if np.isnan(sqft) or sqft <= 0:
+        sqft = 2000.0  # Default to 2000 sqft
+    
+    C = 3.0e5 * sqft  # thermal capacitance proxy (J/K)
+    
+    # Envelope resistance proxy: inverse relationship with size
+    R = 1.0 / (0.001 * sqft)  # envelope resistance proxy (K/W)
+    
+    # HVAC efficiency (COP)
+    hvac_eff = metadata.get("stat.average_dx_cooling_cop", 3.0)
+    if np.isnan(hvac_eff) or hvac_eff <= 0:
+        hvac_eff = 3.0  # Default COP of 3.0
+    
+    # Comfort setpoint (convert Fahrenheit to Celsius)
+    T_set_f = metadata.get("in.tstat_clg_sp_f", 72.0)
+    if np.isnan(T_set_f):
+        T_set_f = 72.0
+    T_set = (T_set_f - 32.0) * 5.0 / 9.0  # Convert F → C
+    
+    # Comfort band
+    deltaT = 2.0  # °C comfort band
+    
+    return C, R, hvac_eff, T_set, deltaT
+
+
+def infer_temperature(
+    y_hat: torch.Tensor,
+    T_out: torch.Tensor,
+    C: float,
+    R: float,
+    T0: float = 22.0,
+    dt: float = 3600.0
+) -> torch.Tensor:
+    """Infer indoor temperature from predicted load using RC circuit dynamics.
+    
+    Uses the discrete RC circuit equation:
+        C * (T_in(t+1) - T_in(t)) / dt = (T_out - T_in) / R + y_hat
+    
+    Args:
+        y_hat: Predicted load (kW) of shape (T,) or (batch, T)
+        T_out: Outdoor temperature (°C) of shape (T,) or (batch, T)
+        C: Thermal capacitance (J/K)
+        R: Envelope resistance (K/W)
+        T0: Initial indoor temperature (°C). Default: 22.0
+        dt: Time step in seconds. Default: 3600.0 (1 hour)
+    
+    Returns:
+        T_hat: Inferred indoor temperature (°C) of same shape as y_hat
+    """
+    # Handle batch dimension
+    if y_hat.dim() == 1:
+        y_hat = y_hat.unsqueeze(0)
+        T_out = T_out.unsqueeze(0)
+        squeeze_output = True
+    else:
+        squeeze_output = False
+    
+    batch_size, seq_len = y_hat.shape
+    device = y_hat.device
+    
+    # Initialize temperature sequence
+    T = torch.zeros(batch_size, seq_len, device=device)
+    T[:, 0] = T0
+    
+    # Convert load from kW to W for consistency with C and R
+    # Assuming y_hat is in kW, convert to W
+    y_hat_W = y_hat * 1000.0  # kW → W
+    
+    # Iteratively compute temperature
+    for t in range(seq_len - 1):
+        # Discrete RC equation: C * dT/dt = (T_out - T_in) / R + P
+        # Rearranged: T_in(t+1) = T_in(t) + (dt/C) * ((T_out - T_in) / R + P)
+        dT_dt = (T_out[:, t] - T[:, t]) / R + y_hat_W[:, t] / C
+        T[:, t+1] = T[:, t] + (dt / C) * dT_dt
+    
+    if squeeze_output:
+        T = T.squeeze(0)
+    
+    return T
+
+
+def rc_loss(
+    T_hat: torch.Tensor,
+    y_hat: torch.Tensor,
+    T_out: torch.Tensor,
+    C: float,
+    R: float,
+    dt: float = 3600.0
+) -> torch.Tensor:
+    """RC circuit energy balance loss.
+    
+    Enforces the discrete RC equation:
+        C * (T_hat(t+1) - T_hat(t)) / dt = (T_out - T_hat) / R + y_hat / C
+    
+    Args:
+        T_hat: Inferred indoor temperature (°C) of shape (T,) or (batch, T)
+        y_hat: Predicted load (kW) of shape (T,) or (batch, T)
+        T_out: Outdoor temperature (°C) of shape (T,) or (batch, T)
+        C: Thermal capacitance (J/K)
+        R: Envelope resistance (K/W)
+        dt: Time step in seconds. Default: 3600.0
+    
+    Returns:
+        Scalar loss value
+    """
+    # Handle batch dimension
+    if T_hat.dim() == 1:
+        T_hat = T_hat.unsqueeze(0)
+        y_hat = y_hat.unsqueeze(0)
+        T_out = T_out.unsqueeze(0)
+    
+    # Compute temperature derivative
+    dT = (T_hat[:, 1:] - T_hat[:, :-1]) / dt
+    
+    # Right-hand side of RC equation
+    # Note: Following user's formulation: dT/dt = (T_out - T_in) / R + y_hat / C
+    # If y_hat is in kW, we convert to W for consistency with C (J/K) and R (K/W)
+    # However, the user's formulation suggests y_hat may already be in appropriate units
+    # We'll convert kW to W to ensure dimensional consistency
+    y_hat_W = y_hat[:, :-1] * 1000.0  # kW → W (if y_hat is in kW)
+    rhs = (T_out[:, :-1] - T_hat[:, :-1]) / R + y_hat_W / C
+    
+    # Physics residual
+    physics_residual = dT - rhs
+    
+    return torch.mean(physics_residual ** 2)
+
+
+def comfort_loss(
+    T_hat: torch.Tensor,
+    T_set: float,
+    deltaT: float = 2.0
+) -> torch.Tensor:
+    """Comfort violation loss.
+    
+    Penalizes predictions that imply indoor temperatures outside the comfort zone.
+    The comfort zone is [T_set - deltaT, T_set + deltaT].
+    
+    Args:
+        T_hat: Inferred indoor temperature (°C) of shape (T,) or (batch, T)
+        T_set: Comfort setpoint (°C)
+        deltaT: Comfort band half-width (°C). Default: 2.0
+    
+    Returns:
+        Scalar loss value
+    """
+    # Compute violation: |T - T_set| - deltaT
+    violation = torch.abs(T_hat - T_set) - deltaT
+    
+    # Only penalize violations (positive values)
+    return torch.mean(torch.relu(violation))
+
+
+def smoothness_loss(y_hat: torch.Tensor) -> torch.Tensor:
+    """Smoothness regularization loss.
+    
+    Suppresses unrealistic hour-to-hour spikes in predicted load.
+    
+    Args:
+        y_hat: Predicted load (kW) of shape (T,) or (batch, T)
+    
+    Returns:
+        Scalar loss value
+    """
+    if y_hat.dim() == 1:
+        y_hat = y_hat.unsqueeze(0)
+    
+    # Compute first difference
+    dy = y_hat[:, 1:] - y_hat[:, :-1]
+    
+    return torch.mean(dy ** 2)
+
+
+class PINNLoss(nn.Module):
+    """Combined PINN loss module for residual learning.
+    
+    This loss combines:
+    1. Data loss (MSE between predictions and targets)
+    2. RC circuit physics loss
+    3. Comfort violation loss
+    4. Smoothness regularization
+    
+    Usage:
+        loss_fn = PINNLoss(metadata, lambda_rc=1.0, lambda_comfort=0.1, lambda_smooth=0.01)
+        loss = loss_fn(y_hat, y_true, y_lgb, T_out)
+    """
+    
+    def __init__(
+        self,
+        metadata: Dict,
+        lambda_rc: float = 1.0,
+        lambda_comfort: float = 0.1,
+        lambda_smooth: float = 0.01,
+        dt: float = 3600.0,
+        T0: float = 22.0
+    ):
+        """Initialize PINN loss.
+        
+        Args:
+            metadata: Building metadata dictionary
+            lambda_rc: Weight for RC circuit loss. Default: 1.0
+            lambda_comfort: Weight for comfort violation loss. Default: 0.1
+            lambda_smooth: Weight for smoothness loss. Default: 0.01
+            dt: Time step in seconds. Default: 3600.0 (1 hour)
+            T0: Initial indoor temperature (°C). Default: 22.0
+        """
+        super().__init__()
+        
+        # Extract building parameters
+        C, R, hvac_eff, T_set, deltaT = extract_building_params(metadata)
+        
+        # Register as buffers (not trainable parameters)
+        self.register_buffer('C', torch.tensor(C, dtype=torch.float32))
+        self.register_buffer('R', torch.tensor(R, dtype=torch.float32))
+        self.register_buffer('T_set', torch.tensor(T_set, dtype=torch.float32))
+        self.register_buffer('deltaT', torch.tensor(deltaT, dtype=torch.float32))
+        self.register_buffer('lambda_rc', torch.tensor(lambda_rc, dtype=torch.float32))
+        self.register_buffer('lambda_comfort', torch.tensor(lambda_comfort, dtype=torch.float32))
+        self.register_buffer('lambda_smooth', torch.tensor(lambda_smooth, dtype=torch.float32))
+        self.register_buffer('dt', torch.tensor(dt, dtype=torch.float32))
+        self.register_buffer('T0', torch.tensor(T0, dtype=torch.float32))
+        
+        # Store as Python floats for use in functions
+        self.C_val = C
+        self.R_val = R
+        self.T_set_val = T_set
+        self.deltaT_val = deltaT
+        self.dt_val = dt
+        self.T0_val = T0
+    
+    def forward(
+        self,
+        y_hat: torch.Tensor,
+        y_true: torch.Tensor,
+        T_out: torch.Tensor,
+        return_components: bool = False
+    ) -> torch.Tensor:
+        """Compute combined PINN loss.
+        
+        Args:
+            y_hat: Final predictions (y_lgb + residual) of shape (batch, T) or (T,)
+            y_true: Ground truth load (kW) of shape (batch, T) or (T,)
+            T_out: Outdoor temperature (°C) of shape (batch, T) or (T,)
+            return_components: If True, return individual loss components. Default: False
+        
+        Returns:
+            Total loss (scalar), or tuple of (total_loss, loss_dict) if return_components=True
+        """
+        # Data loss
+        L_data = torch.mean((y_hat - y_true) ** 2)
+        
+        # Infer indoor temperature
+        T_hat = infer_temperature(
+            y_hat, T_out, self.C_val, self.R_val, self.T0_val, self.dt_val
+        )
+        
+        # RC circuit loss
+        L_rc = rc_loss(T_hat, y_hat, T_out, self.C_val, self.R_val, self.dt_val)
+        
+        # Comfort violation loss
+        L_comfort = comfort_loss(T_hat, self.T_set_val, self.deltaT_val)
+        
+        # Smoothness loss
+        L_smooth = smoothness_loss(y_hat)
+        
+        # Combined loss (REMOVE LOSS FUNC HERE FOR TESTING IF NEEDED)
+        total_loss = (
+            L_data +
+            self.lambda_rc * L_rc +
+            self.lambda_comfort * L_comfort +
+            self.lambda_smooth * L_smooth
+        )
+        
+        if return_components:
+            loss_dict = {
+                'data': L_data.item(),
+                'rc': L_rc.item(),
+                'comfort': L_comfort.item(),
+                'smooth': L_smooth.item(),
+                'total': total_loss.item()
+            }
+            return total_loss, loss_dict
+        
+        return total_loss
+
+
+def compute_pinn_loss(
+    y_hat: torch.Tensor,
+    y_true: torch.Tensor,
+    T_out: torch.Tensor,
+    metadata: Dict,
+    lambda_rc: float = 1.0,
+    lambda_comfort: float = 0.1,
+    lambda_smooth: float = 0.01,
+    dt: float = 3600.0,
+    T0: float = 22.0,
+    return_components: bool = False
+) -> torch.Tensor:
+    """Convenience function to compute PINN loss without creating a module.
+    
+    Args:
+        y_hat: Final predictions (y_lgb + residual) of shape (batch, T) or (T,)
+        y_true: Ground truth load (kW) of shape (batch, T) or (T,)
+        T_out: Outdoor temperature (°C) of shape (batch, T) or (T,)
+        metadata: Building metadata dictionary
+        lambda_rc: Weight for RC circuit loss. Default: 1.0
+        lambda_comfort: Weight for comfort violation loss. Default: 0.1
+        lambda_smooth: Weight for smoothness loss. Default: 0.01
+        dt: Time step in seconds. Default: 3600.0
+        T0: Initial indoor temperature (°C). Default: 22.0
+        return_components: If True, return individual loss components. Default: False
+    
+    Returns:
+        Total loss (scalar), or tuple of (total_loss, loss_dict) if return_components=True
+    """
+    # Extract building parameters
+    C, R, hvac_eff, T_set, deltaT = extract_building_params(metadata)
+    
+    # Data loss
+    L_data = torch.mean((y_hat - y_true) ** 2)
+    
+    # Infer indoor temperature
+    T_hat = infer_temperature(y_hat, T_out, C, R, T0, dt)
+    
+    # RC circuit loss
+    L_rc = rc_loss(T_hat, y_hat, T_out, C, R, dt)
+    
+    # Comfort violation loss
+    L_comfort = comfort_loss(T_hat, T_set, deltaT)
+    
+    # Smoothness loss
+    L_smooth = smoothness_loss(y_hat)
+    
+    # Combined loss
+    total_loss = (
+        L_data +
+        lambda_rc * L_rc +
+        lambda_comfort * L_comfort +
+        lambda_smooth * L_smooth
+    )
+    
+    if return_components:
+        loss_dict = {
+            'data': L_data.item(),
+            'rc': L_rc.item(),
+            'comfort': L_comfort.item(),
+            'smooth': L_smooth.item(),
+            'total': total_loss.item()
+        }
+        return total_loss, loss_dict
+    
+    return total_loss
+
