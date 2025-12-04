@@ -24,13 +24,14 @@ def extract_building_params(metadata: Dict) -> Tuple[float, float, float, float,
             - 'in.sqft': Building square footage
             - 'stat.average_dx_cooling_cop': Average cooling COP (optional)
             - 'in.tstat_clg_sp_f': Cooling setpoint in Fahrenheit (optional)
+            - 'in.tstat_htg_sp_f': Heating setpoint in Fahrenheit (optional)
     
     Returns:
         Tuple of (C, R, hvac_eff, T_set, deltaT):
-            - C: Thermal capacitance proxy (J/K)
-            - R: Envelope resistance proxy (K/W)
+            - C: Thermal capacitance proxy (J/K), estimated from floor area
+            - R: Envelope resistance proxy (K/W), estimated from floor area
             - hvac_eff: HVAC efficiency (COP)
-            - T_set: Comfort setpoint in Celsius
+            - T_set: Comfort setpoint in Celsius (mean of heating and cooling setpoints)
             - deltaT: Comfort band in Celsius
     """
     # Thermal capacitance proxy: scales with building size
@@ -48,10 +49,14 @@ def extract_building_params(metadata: Dict) -> Tuple[float, float, float, float,
     if np.isnan(hvac_eff) or hvac_eff <= 0:
         hvac_eff = 3.0  # Default COP of 3.0
     
-    # Comfort setpoint (convert Fahrenheit to Celsius)
-    T_set_f = metadata.get("in.tstat_clg_sp_f", 72.0)
-    if np.isnan(T_set_f):
-        T_set_f = 72.0
+    # Comfort setpoint: mean of heating and cooling setpoints (convert Fahrenheit to Celsius)
+    T_clg_f = metadata.get("in.tstat_clg_sp_f", 72.0)
+    T_htg_f = metadata.get("in.tstat_htg_sp_f", 68.0)
+    if np.isnan(T_clg_f):
+        T_clg_f = 72.0
+    if np.isnan(T_htg_f):
+        T_htg_f = 68.0
+    T_set_f = (T_clg_f + T_htg_f) / 2.0  # Mean of heating and cooling setpoints
     T_set = (T_set_f - 32.0) * 5.0 / 9.0  # Convert F → C
     
     # Comfort band
@@ -127,7 +132,9 @@ def rc_loss(
     """RC circuit energy balance loss.
     
     Enforces the discrete RC equation:
-        C * (T_hat(t+1) - T_hat(t)) / dt = (T_out - T_hat) / R + y_hat / C
+        C * (T_hat(t+1) - T_hat(t)) / dt = (T_out - T_hat) / R + P
+    
+    Where P is power in W. The input y_hat is in kW and is converted to W.
     
     Args:
         T_hat: Inferred indoor temperature (°C) of shape (T,) or (batch, T)
@@ -189,9 +196,10 @@ def comfort_loss(
 
 
 def smoothness_loss(y_hat: torch.Tensor) -> torch.Tensor:
-    """Smoothness regularization loss.
+    """Thermal-inertia smoothness loss (second-order derivative).
     
-    Suppresses unrealistic hour-to-hour spikes in predicted load.
+    Enforces gradual changes in energy consumption consistent with thermal mass effects.
+    Penalizes the second-order temporal derivative: (y_t - 2*y_{t-1} + y_{t-2})²
     
     Args:
         y_hat: Predicted load (kW) of shape (T,) or (batch, T)
@@ -202,24 +210,32 @@ def smoothness_loss(y_hat: torch.Tensor) -> torch.Tensor:
     if y_hat.dim() == 1:
         y_hat = y_hat.unsqueeze(0)
     
-    # Compute first difference
-    dy = y_hat[:, 1:] - y_hat[:, :-1]
+    # Compute second-order derivative: (y_t - 2*y_{t-1} + y_{t-2})
+    # Need at least 3 timesteps
+    if y_hat.shape[1] < 3:
+        return torch.tensor(0.0, device=y_hat.device)
     
-    return torch.mean(dy ** 2)
+    d2y = y_hat[:, 2:] - 2.0 * y_hat[:, 1:-1] + y_hat[:, :-2]
+    
+    return torch.mean(d2y ** 2)
 
 
 class PINNLoss(nn.Module):
     """Combined PINN loss module for residual learning.
     
-    This loss combines:
-    1. Data loss (MSE between predictions and targets)
-    2. RC circuit physics loss
-    3. Comfort violation loss
-    4. Smoothness regularization
+    Implements the physics-informed loss functions for hybrid LightGBM + PINN forecasting:
+    
+    L_total = L_MSE + β_RC * L_RC + β_comfort * L_comfort + β_smooth * L_smooth
+    
+    Where:
+    1. L_MSE: Residual mean-squared error (data-fitting)
+    2. L_RC: Energy-balance loss from 1R1C thermal model
+    3. L_comfort: Comfort-zone consistency loss
+    4. L_smooth: Thermal-inertia smoothness loss (second-order derivative)
     
     Usage:
         loss_fn = PINNLoss(metadata, lambda_rc=1.0, lambda_comfort=0.1, lambda_smooth=0.01)
-        loss = loss_fn(y_hat, y_true, y_lgb, T_out)
+        loss = loss_fn(y_hat, y_true, T_out)
     """
     
     def __init__(

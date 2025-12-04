@@ -14,6 +14,7 @@ The workflow:
 from pathlib import Path
 import os
 import argparse
+import json
 import pandas as pd
 import numpy as np
 import torch
@@ -71,9 +72,10 @@ class ResidualNetwork(nn.Module):
             Residual predictions of shape (batch, seq_len, 1)
         """
         batch_size, seq_len, input_dim = x.shape
-        x_flat = x.view(batch_size * seq_len, input_dim)
+        # Use reshape instead of view to handle non-contiguous tensors safely
+        x_flat = x.reshape(batch_size * seq_len, input_dim)
         residual_flat = self.network(x_flat)
-        return residual_flat.view(batch_size, seq_len, 1)
+        return residual_flat.reshape(batch_size, seq_len, 1)
 
 
 def prepare_features(batch: dict, use_weather: bool = True) -> torch.Tensor:
@@ -81,6 +83,7 @@ def prepare_features(batch: dict, use_weather: bool = True) -> torch.Tensor:
     
     Args:
         batch: Dictionary with keys like 'load', 'day_of_year', 'hour_of_day', etc.
+               All tensors should have shape (batch, seq_len, 1) where seq_len = context_len + pred_len
         use_weather: Whether to include weather features
     
     Returns:
@@ -88,23 +91,28 @@ def prepare_features(batch: dict, use_weather: bool = True) -> torch.Tensor:
     """
     features = []
     
-    # Time features
+    # Time features - shape (batch, seq_len, 1)
     features.append(batch['day_of_year'])
     features.append(batch['day_of_week'])
     features.append(batch['hour_of_day'])
     
-    # Spatial features
+    # Spatial features - shape (batch, seq_len, 1)
     features.append(batch['latitude'])
     features.append(batch['longitude'])
     
-    # Building type
+    # Building type - shape (batch, seq_len, 1)
     features.append(batch['building_type'].float())
     
-    # Historical load (context)
+    # Historical load - use full sequence for features
+    # Note: For prediction window, we'll use context mean as a summary feature
     if 'load' in batch:
-        features.append(batch['load'][:, :batch['load'].shape[1] - 24])  # Exclude prediction window
+        # Use mean of context as a feature (repeated for all timesteps)
+        context_len = batch['load'].shape[1] - 24  # Assuming last 24 is prediction window
+        context_mean = batch['load'][:, :context_len].mean(dim=1, keepdim=True)  # (batch, 1, 1)
+        context_mean = context_mean.expand(-1, batch['load'].shape[1], -1)  # (batch, seq_len, 1)
+        features.append(context_mean)
     
-    # Weather features
+    # Weather features - shape (batch, seq_len, 1)
     if use_weather and 'temperature' in batch:
         features.append(batch['temperature'])
     
@@ -159,10 +167,41 @@ def train_pinn_residual(
     # Training loop
     best_val_loss = float('inf')
     patience_counter = 0
+    loss_history = {
+        'epoch': [],
+        'train': {
+            'total': [],
+            'data': [],
+            'rc': [],
+            'comfort': [],
+            'smooth': []
+        },
+        'val': {
+            'total': [],
+            'data': [],
+            'rc': [],
+            'comfort': [],
+            'smooth': []
+        },
+        'metrics': {
+            'train_mse': [],
+            'train_mae': [],
+            'val_mse': [],
+            'val_mae': [],
+            'residual_mean': [],
+            'residual_std': [],
+            'grad_norm': []
+        }
+    }
     
     for epoch in range(args.max_epochs):
         residual_net.train()
         train_losses = []
+        train_loss_components = {'data': [], 'rc': [], 'comfort': [], 'smooth': []}
+        train_mses = []
+        train_maes = []
+        residual_values = []
+        grad_norms = []
         
         lgbm_idx = 0
         for batch_idx, batch in enumerate(train_dataloader):
@@ -190,8 +229,21 @@ def train_pinn_residual(
                 T_out = torch.ones_like(y_true) * 20.0  # 20°C default
             
             # Predict residual
-            residual = residual_net(features[:, -24:])  # Use features for prediction window
-            residual = residual.squeeze(-1)  # (batch, 24)
+            residual = residual_net(features[:, -24:])  # (batch, seq_len, 1)
+            residual = residual.squeeze(-1)            # (batch, T_resid) or (T_resid,)
+            
+            # Ensure both tensors have explicit batch dimension
+            if y_lgb_batch.dim() == 1:
+                y_lgb_batch = y_lgb_batch.unsqueeze(0)
+            if residual.dim() == 1:
+                residual = residual.unsqueeze(0)
+            
+            # Align LightGBM predictions, residual, and targets length defensively
+            T = min(y_lgb_batch.shape[1], residual.shape[1], y_true.shape[1], T_out.shape[1])
+            y_lgb_batch = y_lgb_batch[:, :T]
+            residual = residual[:, :T]
+            y_true = y_true[:, :T]
+            T_out = T_out[:, :T]
             
             # Final prediction
             y_hat = y_lgb_batch + residual
@@ -205,13 +257,40 @@ def train_pinn_residual(
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
+            
+            # Track gradient norm
+            total_grad_norm = 0.0
+            for p in residual_net.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_grad_norm += param_norm.item() ** 2
+            total_grad_norm = total_grad_norm ** (1. / 2)
+            grad_norms.append(total_grad_norm)
+            
             optimizer.step()
             
+            # Track losses and metrics
             train_losses.append(loss.item())
+            train_loss_components['data'].append(loss_components['data'])
+            train_loss_components['rc'].append(loss_components['rc'])
+            train_loss_components['comfort'].append(loss_components['comfort'])
+            train_loss_components['smooth'].append(loss_components['smooth'])
+            
+            # Track prediction metrics
+            mse = torch.mean((y_hat - y_true.squeeze(-1)) ** 2).item()
+            mae = torch.mean(torch.abs(y_hat - y_true.squeeze(-1))).item()
+            train_mses.append(mse)
+            train_maes.append(mae)
+            
+            # Track residual statistics
+            residual_values.extend(residual.detach().cpu().numpy().flatten().tolist())
         
         # Validation
         residual_net.eval()
         val_losses = []
+        val_loss_components = {'data': [], 'rc': [], 'comfort': [], 'smooth': []}
+        val_mses = []
+        val_maes = []
         
         lgbm_idx = 0
         with torch.no_grad():
@@ -235,15 +314,69 @@ def train_pinn_residual(
                     T_out = torch.ones_like(y_true) * 20.0
                 
                 residual = residual_net(features[:, -24:]).squeeze(-1)
+                # Ensure both tensors have explicit batch dimension
+                if y_lgb_batch.dim() == 1:
+                    y_lgb_batch = y_lgb_batch.unsqueeze(0)
+                if residual.dim() == 1:
+                    residual = residual.unsqueeze(0)
+                # Align lengths as in training loop
+                T = min(y_lgb_batch.shape[1], residual.shape[1], y_true.shape[1], T_out.shape[1])
+                y_lgb_batch = y_lgb_batch[:, :T]
+                residual = residual[:, :T]
+                y_true = y_true[:, :T]
+                T_out = T_out[:, :T]
                 y_hat = y_lgb_batch + residual
                 
-                loss = pinn_loss_fn(y_hat, y_true.squeeze(-1), T_out.squeeze(-1))
+                loss, loss_components = pinn_loss_fn(
+                    y_hat, y_true.squeeze(-1), T_out.squeeze(-1),
+                    return_components=True
+                )
                 val_losses.append(loss.item())
+                val_loss_components['data'].append(loss_components['data'])
+                val_loss_components['rc'].append(loss_components['rc'])
+                val_loss_components['comfort'].append(loss_components['comfort'])
+                val_loss_components['smooth'].append(loss_components['smooth'])
+                
+                # Track prediction metrics
+                mse = torch.mean((y_hat - y_true.squeeze(-1)) ** 2).item()
+                mae = torch.mean(torch.abs(y_hat - y_true.squeeze(-1))).item()
+                val_mses.append(mse)
+                val_maes.append(mae)
         
+        # Compute averages
         avg_train_loss = np.mean(train_losses)
         avg_val_loss = np.mean(val_losses)
         
+        # Record loss history
+        loss_history['epoch'].append(epoch)
+        loss_history['train']['total'].append(avg_train_loss)
+        loss_history['train']['data'].append(np.mean(train_loss_components['data']))
+        loss_history['train']['rc'].append(np.mean(train_loss_components['rc']))
+        loss_history['train']['comfort'].append(np.mean(train_loss_components['comfort']))
+        loss_history['train']['smooth'].append(np.mean(train_loss_components['smooth']))
+        
+        loss_history['val']['total'].append(avg_val_loss)
+        loss_history['val']['data'].append(np.mean(val_loss_components['data']))
+        loss_history['val']['rc'].append(np.mean(val_loss_components['rc']))
+        loss_history['val']['comfort'].append(np.mean(val_loss_components['comfort']))
+        loss_history['val']['smooth'].append(np.mean(val_loss_components['smooth']))
+        
+        # Record metrics
+        loss_history['metrics']['train_mse'].append(np.mean(train_mses))
+        loss_history['metrics']['train_mae'].append(np.mean(train_maes))
+        loss_history['metrics']['val_mse'].append(np.mean(val_mses))
+        loss_history['metrics']['val_mae'].append(np.mean(val_maes))
+        loss_history['metrics']['residual_mean'].append(np.mean(residual_values) if residual_values else 0.0)
+        loss_history['metrics']['residual_std'].append(np.std(residual_values) if residual_values else 0.0)
+        loss_history['metrics']['grad_norm'].append(np.mean(grad_norms) if grad_norms else 0.0)
+        
         print(f'Epoch {epoch}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}')
+        print(f'  Components - Data: {np.mean(train_loss_components["data"]):.4f}, '
+              f'RC: {np.mean(train_loss_components["rc"]):.4f}, '
+              f'Comfort: {np.mean(train_loss_components["comfort"]):.4f}, '
+              f'Smooth: {np.mean(train_loss_components["smooth"]):.4f}')
+        print(f'  Metrics - Train MSE: {np.mean(train_mses):.4f}, Val MSE: {np.mean(val_mses):.4f}, '
+              f'Grad Norm: {np.mean(grad_norms):.4f}')
         
         # Early stopping
         if avg_val_loss < best_val_loss:
@@ -259,7 +392,7 @@ def train_pinn_residual(
     
     # Load best model
     residual_net.load_state_dict(torch.load('best_pinn_residual.pt'))
-    return residual_net
+    return residual_net, loss_history
 
 
 def transfer_learning_pinn(args, results_path: Path):
@@ -343,14 +476,17 @@ def transfer_learning_pinn(args, results_path: Path):
             )
             
             # Create PyTorch datasets
+            # For transformer-style datasets, we optionally include temperature as
+            # an additional input feature via the `weather_inputs` argument.
+            weather_inputs = ['temperature'] if args.use_temperature_input else None
             train_dataset = PandasTransformerDataset(
-                training_set_, sliding_window=24, weather=args.use_temperature_input
+                training_set_, sliding_window=24, weather_inputs=weather_inputs
             )
             val_dataset = PandasTransformerDataset(
-                validation_set, sliding_window=24, weather=args.use_temperature_input
+                validation_set, sliding_window=24, weather_inputs=weather_inputs
             )
             test_dataset = PandasTransformerDataset(
-                test_set, sliding_window=24, weather=args.use_temperature_input
+                test_set, sliding_window=24, weather_inputs=weather_inputs
             )
             
             train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
@@ -391,11 +527,17 @@ def transfer_learning_pinn(args, results_path: Path):
             
             # Train PINN residual network
             print('Training PINN residual network...')
-            residual_net = train_pinn_residual(
+            residual_net, loss_history = train_pinn_residual(
                 train_loader, val_loader,
                 lgbm_train_preds, lgbm_val_preds,
                 metadata, args, device
             )
+            
+            # Save loss history
+            loss_file = results_path / f'loss_history_{dataset_name}_{building_name}.json'
+            with open(loss_file, 'w') as f:
+                json.dump(loss_history, f, indent=2)
+            print(f'Saved loss history to {loss_file}')
             
             # Evaluate on test set
             print('Evaluating on test set...')
@@ -421,7 +563,14 @@ def transfer_learning_pinn(args, results_path: Path):
                     batch[k] = torch.from_numpy(v).unsqueeze(0).to(device)
                 
                 features = prepare_features(batch, use_weather=args.use_temperature_input)
-                residual = residual_net(features[:, -24:]).squeeze(-1).squeeze(0).cpu().numpy()
+                residual = (
+                    residual_net(features[:, -24:])
+                    .squeeze(-1)
+                    .squeeze(0)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
                 
                 # Final prediction
                 final_pred = lgbm_pred.values.flatten() + residual

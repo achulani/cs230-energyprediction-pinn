@@ -477,21 +477,16 @@ class PandasBuildingDatasetsFromCSV:
         df["day_of_year"] = time_features[:, 0] * np.ones(df.shape[0])
 
         if weather_df is not None:
-            # TODO: Test
-
-            #weather_df = weather_df.loc[:, ['temperature']]
-            #weather_transform = StandardScalerTransform()
-            #weather_transform.load(self.weather_transform_path / 'temperature')
-            #weather_df['temperature'] = weather_transform.transform(weather_df['temperature'].to_numpy())[0]
-
-            weather_transform = StandardScalerTransform()
-            for col in weather_df.columns[1:]:
-                weather_transform.load(self.weather_transform_path / col)
-                weather_df.update({col : weather_transform.transform(weather_df[col].to_numpy())[0][...,None]})
-
-            weather_df = weather_df.loc[:, ['temperature']]
-
-            df = df.join(weather_df)
+            # For transformer-style datasets we only require temperature as an
+            # additional input feature. Using the raw temperature column keeps
+            # the pipeline simple and avoids potential mismatches between the
+            # available weather CSV columns and any pre-fitted transforms on
+            # disk that can lead to pandas index/shape errors.
+            #
+            # Keep only temperature and join directly on the main dataframe.
+            if 'temperature' in weather_df.columns:
+                weather_df = weather_df.loc[:, ['temperature']]
+                df = df.join(weather_df)
 
         if bldg_name in self.building_datasets:
             self.building_datasets[bldg_name] += [(year,df)]
