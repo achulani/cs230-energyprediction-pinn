@@ -245,7 +245,10 @@ class PINNLoss(nn.Module):
         lambda_comfort: float = 0.1,
         lambda_smooth: float = 0.01,
         dt: float = 3600.0,
-        T0: float = 22.0
+        T0: float = 22.0,
+        use_rc_loss: bool = True,
+        use_comfort_loss: bool = True,
+        use_smooth_loss: bool = True
     ):
         """Initialize PINN loss.
         
@@ -256,6 +259,9 @@ class PINNLoss(nn.Module):
             lambda_smooth: Weight for smoothness loss. Default: 0.01
             dt: Time step in seconds. Default: 3600.0 (1 hour)
             T0: Initial indoor temperature (°C). Default: 22.0
+            use_rc_loss: Whether to include RC circuit loss. Default: True
+            use_comfort_loss: Whether to include comfort loss. Default: True
+            use_smooth_loss: Whether to include smoothness loss. Default: True
         """
         super().__init__()
         
@@ -280,6 +286,11 @@ class PINNLoss(nn.Module):
         self.deltaT_val = deltaT
         self.dt_val = dt
         self.T0_val = T0
+        
+        # Store loss component flags
+        self.use_rc_loss = use_rc_loss
+        self.use_comfort_loss = use_comfort_loss
+        self.use_smooth_loss = use_smooth_loss
     
     def forward(
         self,
@@ -307,22 +318,23 @@ class PINNLoss(nn.Module):
             y_hat, T_out, self.C_val, self.R_val, self.T0_val, self.dt_val
         )
         
-        # RC circuit loss
-        L_rc = rc_loss(T_hat, y_hat, T_out, self.C_val, self.R_val, self.dt_val)
+        # RC circuit loss (only compute if enabled)
+        L_rc = rc_loss(T_hat, y_hat, T_out, self.C_val, self.R_val, self.dt_val) if self.use_rc_loss else torch.tensor(0.0, device=y_hat.device)
         
-        # Comfort violation loss
-        L_comfort = comfort_loss(T_hat, self.T_set_val, self.deltaT_val)
+        # Comfort violation loss (only compute if enabled)
+        L_comfort = comfort_loss(T_hat, self.T_set_val, self.deltaT_val) if self.use_comfort_loss else torch.tensor(0.0, device=y_hat.device)
         
-        # Smoothness loss
-        L_smooth = smoothness_loss(y_hat)
+        # Smoothness loss (only compute if enabled)
+        L_smooth = smoothness_loss(y_hat) if self.use_smooth_loss else torch.tensor(0.0, device=y_hat.device)
         
-        # Combined loss (REMOVE LOSS FUNC HERE FOR TESTING IF NEEDED)
-        total_loss = (
-            L_data +
-            self.lambda_rc * L_rc +
-            self.lambda_comfort * L_comfort +
-            self.lambda_smooth * L_smooth
-        )
+        # Combined loss
+        total_loss = L_data
+        if self.use_rc_loss:
+            total_loss = total_loss + self.lambda_rc * L_rc
+        if self.use_comfort_loss:
+            total_loss = total_loss + self.lambda_comfort * L_comfort
+        if self.use_smooth_loss:
+            total_loss = total_loss + self.lambda_smooth * L_smooth
         
         if return_components:
             loss_dict = {

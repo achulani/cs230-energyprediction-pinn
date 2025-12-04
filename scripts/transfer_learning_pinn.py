@@ -1,14 +1,16 @@
 """
-Transfer Learning with PINN Loss Functions.
+Train PINN Residual Networks for Building Energy Forecasting.
 
-This script demonstrates how to use Physics-Informed Neural Network (PINN) losses
-for residual learning, where a neural network corrects LightGBM predictions.
+This script trains Physics-Informed Neural Network (PINN) residual networks
+for each building independently, where a neural network corrects LightGBM predictions.
 
 The workflow:
 1. Train LightGBM on historical data to get initial predictions y_lgb
-2. Train a residual network (PINN) to predict corrections r
+2. Train a residual network (PINN) to predict corrections r for each building
 3. Final prediction: y_hat = y_lgb + r
 4. Loss includes physics constraints (RC circuit, comfort, smoothness)
+
+Note: Each building is trained independently from scratch (no weight transfer).
 """
 
 from pathlib import Path
@@ -119,6 +121,39 @@ def prepare_features(batch: dict, use_weather: bool = True) -> torch.Tensor:
     return torch.cat(features, dim=-1)
 
 
+def aggregate_model_weights(weight_dicts: list) -> dict:
+    """Aggregate multiple model state dicts by averaging weights.
+    
+    Args:
+        weight_dicts: List of state dictionaries from multiple models
+    
+    Returns:
+        Averaged state dictionary
+    """
+    if len(weight_dicts) == 0:
+        raise ValueError("Cannot aggregate empty list of weights")
+    
+    if len(weight_dicts) == 1:
+        return weight_dicts[0]
+    
+    # Initialize aggregated weights with first model
+    aggregated = {}
+    for key in weight_dicts[0].keys():
+        aggregated[key] = weight_dicts[0][key].clone()
+    
+    # Average remaining models
+    for weight_dict in weight_dicts[1:]:
+        for key in aggregated.keys():
+            if key in weight_dict:
+                aggregated[key] += weight_dict[key]
+    
+    # Divide by number of models
+    for key in aggregated.keys():
+        aggregated[key] /= len(weight_dicts)
+    
+    return aggregated
+
+
 def train_pinn_residual(
     train_dataloader: DataLoader,
     val_dataloader: DataLoader,
@@ -126,7 +161,8 @@ def train_pinn_residual(
     lgbm_predictions_val: np.ndarray,
     metadata: dict,
     args,
-    device: str
+    device: str,
+    pretrained_weights: dict = None
 ):
     """Train residual network with PINN losses.
     
@@ -138,6 +174,7 @@ def train_pinn_residual(
         metadata: Building metadata dictionary
         args: Command line arguments
         device: Device to run on ('cuda' or 'cpu')
+        pretrained_weights: Optional pretrained weights to initialize from
     """
     # Initialize residual network
     # Feature dimension: time (3) + spatial (2) + building_type (1) + load_context (context_len) + weather (1 if available)
@@ -153,16 +190,32 @@ def train_pinn_residual(
         dropout=0.1
     ).to(device)
     
+    # Load pretrained weights if provided
+    if pretrained_weights is not None:
+        try:
+            # Try to load all matching weights
+            residual_net.load_state_dict(pretrained_weights, strict=False)
+            print("Loaded pretrained weights (some layers may not match)")
+        except Exception as e:
+            print(f"Warning: Could not load pretrained weights: {e}")
+            print("Training from scratch instead")
+    
     # Initialize PINN loss
     pinn_loss_fn = PINNLoss(
         metadata=metadata,
         lambda_rc=args.lambda_rc,
         lambda_comfort=args.lambda_comfort,
-        lambda_smooth=args.lambda_smooth
+        lambda_smooth=args.lambda_smooth,
+        use_rc_loss=args.use_rc_loss,
+        use_comfort_loss=args.use_comfort_loss,
+        use_smooth_loss=args.use_smooth_loss
     ).to(device)
     
-    # Optimizer
-    optimizer = torch.optim.AdamW(residual_net.parameters(), lr=args.lr)
+    # Optimizer - use fine-tuning LR if pretrained weights were loaded
+    lr = args.finetune_lr if (pretrained_weights is not None and args.finetune_lr > 0) else args.lr
+    optimizer = torch.optim.AdamW(residual_net.parameters(), lr=lr)
+    if pretrained_weights is not None and args.finetune_lr > 0:
+        print(f"Using fine-tuning learning rate: {lr} (pretrained model)")
     
     # Training loop
     best_val_loss = float('inf')
@@ -392,11 +445,16 @@ def train_pinn_residual(
     
     # Load best model
     residual_net.load_state_dict(torch.load('best_pinn_residual.pt'))
-    return residual_net, loss_history
+    return residual_net, loss_history, residual_net.state_dict()  # Return weights for aggregation
 
 
-def transfer_learning_pinn(args, results_path: Path):
-    """Main transfer learning function with PINN losses."""
+def train_and_evaluate_pinn_models(args, results_path: Path):
+    """Train and evaluate PINN residual networks for each building.
+    
+    Supports two modes:
+    1. Pretraining: Train on all buildings and aggregate weights
+    2. Fine-tuning: Load pretrained weights and fine-tune on new buildings
+    """
     global benchmark_registry
     device = args.device
     lag = 168
@@ -408,6 +466,16 @@ def transfer_learning_pinn(args, results_path: Path):
     
     metrics_manager = DatasetMetricsManager()
     
+    # Load pretrained weights if provided
+    pretrained_weights = None
+    if args.pretrained_weights:
+        pretrained_path = Path(args.pretrained_weights)
+        if pretrained_path.exists():
+            pretrained_weights = torch.load(pretrained_path, map_location=device)
+            print(f"Loaded pretrained weights from {pretrained_path}")
+        else:
+            print(f"Warning: Pretrained weights file not found: {pretrained_path}")
+    
     target_buildings = []
     if not args.dont_subsample_buildings:
         metadata_dir = Path(os.environ.get('BUILDINGS_BENCH', ''), 'metadata')
@@ -415,6 +483,9 @@ def transfer_learning_pinn(args, results_path: Path):
             target_buildings += f.read().splitlines()
         with open(metadata_dir / 'transfer_learning_residential_buildings.txt', 'r') as f:
             target_buildings += f.read().splitlines()
+    
+    # Collect weights for aggregation (pretraining mode)
+    collected_weights = []
     
     for dataset_name in args.benchmark:
         dataset_generator = load_pandas_dataset(
@@ -527,14 +598,24 @@ def transfer_learning_pinn(args, results_path: Path):
             
             # Train PINN residual network
             print('Training PINN residual network...')
-            residual_net, loss_history = train_pinn_residual(
+            residual_net, loss_history, trained_weights = train_pinn_residual(
                 train_loader, val_loader,
                 lgbm_train_preds, lgbm_val_preds,
-                metadata, args, device
+                metadata, args, device,
+                pretrained_weights=pretrained_weights
             )
             
+            # Collect weights for aggregation (if in pretraining mode)
+            if args.pretrain_mode:
+                collected_weights.append(trained_weights)
+                # Save individual building weights
+                exp_suffix = f'_{args.experiment_name}' if args.experiment_name else ''
+                building_weight_file = results_path / f'weights_{dataset_name}_{building_name}{exp_suffix}.pt'
+                torch.save(trained_weights, building_weight_file)
+            
             # Save loss history
-            loss_file = results_path / f'loss_history_{dataset_name}_{building_name}.json'
+            exp_suffix = f'_{args.experiment_name}' if args.experiment_name else ''
+            loss_file = results_path / f'loss_history_{dataset_name}_{building_name}{exp_suffix}.json'
             with open(loss_file, 'w') as f:
                 json.dump(loss_history, f, indent=2)
             print(f'Saved loss history to {loss_file}')
@@ -598,17 +679,27 @@ def transfer_learning_pinn(args, results_path: Path):
     # Save results
     print('Generating summaries...')
     variant_name = f':{args.variant_name}' if args.variant_name != '' else ''
-    metrics_file = results_path / f'TL_metrics_pinn{variant_name}.csv'
+    exp_suffix = f'_{args.experiment_name}' if args.experiment_name else ''
+    metrics_file = results_path / f'TL_metrics_pinn{variant_name}{exp_suffix}.csv'
     
     metrics_df = metrics_manager.summary()
     if metrics_file.exists():
         metrics_df.to_csv(metrics_file, mode='a', index=False, header=False)
     else:
         metrics_df.to_csv(metrics_file, index=False)
+    
+    # Aggregate weights if in pretraining mode
+    if args.pretrain_mode and len(collected_weights) > 0:
+        print(f"\nAggregating weights from {len(collected_weights)} buildings...")
+        aggregated_weights = aggregate_model_weights(collected_weights)
+        aggregated_path = results_path / 'pretrained_pinn_weights.pt'
+        torch.save(aggregated_weights, aggregated_path)
+        print(f"Saved aggregated pretrained weights to {aggregated_path}")
+        print(f"You can use these weights for fine-tuning new buildings with --pretrained_weights {aggregated_path}")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Transfer Learning with PINN Losses')
+    parser = argparse.ArgumentParser(description='Train PINN Residual Networks for Building Energy Forecasting')
     
     parser.add_argument('--results_path', type=str, default='results/')
     parser.add_argument('--benchmark', nargs='+', type=str, default=['all'])
@@ -617,7 +708,7 @@ if __name__ == '__main__':
     parser.add_argument('--include_outliers', action='store_true')
     parser.add_argument('--device', type=str, default='cuda')
     
-    # Transfer learning - data
+    # Training data configuration
     parser.add_argument('--num_training_days', type=int, default=180)
     parser.add_argument('--dont_subsample_buildings', action='store_true', default=False)
     parser.add_argument('--use_temperature_input', action='store_true')
@@ -627,11 +718,29 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_comfort', type=float, default=0.1, help='Weight for comfort loss')
     parser.add_argument('--lambda_smooth', type=float, default=0.01, help='Weight for smoothness loss')
     
+    # PINN loss component flags
+    parser.add_argument('--use_rc_loss', action='store_true', default=True, help='Enable RC circuit loss')
+    parser.add_argument('--no_rc_loss', dest='use_rc_loss', action='store_false', help='Disable RC circuit loss')
+    parser.add_argument('--use_comfort_loss', action='store_true', default=True, help='Enable comfort loss')
+    parser.add_argument('--no_comfort_loss', dest='use_comfort_loss', action='store_false', help='Disable comfort loss')
+    parser.add_argument('--use_smooth_loss', action='store_true', default=True, help='Enable smoothness loss')
+    parser.add_argument('--no_smooth_loss', dest='use_smooth_loss', action='store_false', help='Disable smoothness loss')
+    
+    # Experiment configuration
+    parser.add_argument('--experiment_name', type=str, default='', help='Name for this experiment (used in output filenames)')
+    
     # Training hyperparameters
     parser.add_argument('--max_epochs', type=int, default=25)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for training from scratch')
+    parser.add_argument('--finetune_lr', type=float, default=1e-5, help='Learning rate for fine-tuning (when using pretrained weights). Set to 0 to use --lr')
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--patience', type=int, default=5)
+    
+    # Transfer learning options
+    parser.add_argument('--pretrain_mode', action='store_true', 
+                       help='Pretraining mode: collect and aggregate weights from all buildings')
+    parser.add_argument('--pretrained_weights', type=str, default=None,
+                       help='Path to pretrained weights file for fine-tuning new buildings')
     
     args = parser.parse_args()
     utils.set_seed(args.seed)
@@ -641,5 +750,5 @@ if __name__ == '__main__':
         results_path = results_path / 'buildingsbench_with_outliers'
     results_path.mkdir(parents=True, exist_ok=True)
     
-    transfer_learning_pinn(args, results_path)
+    train_and_evaluate_pinn_models(args, results_path)
 

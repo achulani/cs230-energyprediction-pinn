@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 import seaborn as sns
+import json
+import glob
 
 # Set style
 sns.set_style("whitegrid")
@@ -165,6 +167,248 @@ def plot_per_hour_metrics(lgbm_df: pd.DataFrame, pinn_df: pd.DataFrame,
         plt.show()
 
 
+def plot_loss_curves_from_json(json_file: Path, save_path: Path = None, plot_components: bool = True):
+    """Plot training and validation loss curves from a single loss history JSON file."""
+    
+    with open(json_file, 'r') as f:
+        loss_history = json.load(f)
+    
+    epochs = loss_history['epoch']
+    
+    # Handle both old and new format
+    if isinstance(loss_history['train'], list):
+        # Old format
+        train_losses = loss_history['train']
+        val_losses = loss_history['val']
+        plot_components = False
+    else:
+        # New format with components
+        train_losses = loss_history['train']['total']
+        val_losses = loss_history['val']['total']
+    
+    if plot_components and isinstance(loss_history['train'], dict):
+        # Plot with components
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # Total loss
+        ax = axes[0, 0]
+        ax.plot(epochs, train_losses, 'o-', label='Training', linewidth=2, markersize=4)
+        ax.plot(epochs, val_losses, 's-', label='Validation', linewidth=2, markersize=4)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Total Loss')
+        ax.set_title('Total Loss')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Loss components
+        ax = axes[0, 1]
+        ax.plot(epochs, loss_history['train']['data'], 'o-', label='Data (train)', linewidth=1.5, markersize=3)
+        ax.plot(epochs, loss_history['train']['rc'], 's-', label='RC (train)', linewidth=1.5, markersize=3)
+        ax.plot(epochs, loss_history['train']['comfort'], '^-', label='Comfort (train)', linewidth=1.5, markersize=3)
+        ax.plot(epochs, loss_history['train']['smooth'], 'v-', label='Smooth (train)', linewidth=1.5, markersize=3)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss Component')
+        ax.set_title('Training Loss Components')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        ax.set_yscale('log')
+        
+        # Validation loss components
+        ax = axes[1, 0]
+        ax.plot(epochs, loss_history['val']['data'], 'o-', label='Data (val)', linewidth=1.5, markersize=3)
+        ax.plot(epochs, loss_history['val']['rc'], 's-', label='RC (val)', linewidth=1.5, markersize=3)
+        ax.plot(epochs, loss_history['val']['comfort'], '^-', label='Comfort (val)', linewidth=1.5, markersize=3)
+        ax.plot(epochs, loss_history['val']['smooth'], 'v-', label='Smooth (val)', linewidth=1.5, markersize=3)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss Component')
+        ax.set_title('Validation Loss Components')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        ax.set_yscale('log')
+        
+        # Metrics
+        ax = axes[1, 1]
+        if 'metrics' in loss_history:
+            ax.plot(epochs, loss_history['metrics']['train_mse'], 'o-', label='Train MSE', linewidth=1.5, markersize=3)
+            ax.plot(epochs, loss_history['metrics']['val_mse'], 's-', label='Val MSE', linewidth=1.5, markersize=3)
+            ax2 = ax.twinx()
+            ax2.plot(epochs, loss_history['metrics']['grad_norm'], '^-', label='Grad Norm', 
+                    color='red', linewidth=1.5, markersize=3)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('MSE', color='blue')
+            ax2.set_ylabel('Gradient Norm', color='red')
+            ax.set_title('Metrics & Gradient Norm')
+            ax.legend(loc='upper left', fontsize=8)
+            ax2.legend(loc='upper right', fontsize=8)
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(axis='y', labelcolor='blue')
+            ax2.tick_params(axis='y', labelcolor='red')
+        
+        plt.suptitle(f'Training Progress: {json_file.stem}', fontsize=14, y=0.995)
+        plt.tight_layout()
+    else:
+        # Simple plot
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, train_losses, 'o-', label='Training Loss', linewidth=2, markersize=4)
+        plt.plot(epochs, val_losses, 's-', label='Validation Loss', linewidth=2, markersize=4)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title(f'Training and Validation Loss Curves\n{json_file.stem}')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved plot to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_aggregated_losses_from_json(results_dir: Path, save_path: Path = None):
+    """Plot mean and std of losses across all buildings from JSON files."""
+    
+    loss_files = list(results_dir.glob('loss_history_*.json'))
+    
+    if len(loss_files) == 0:
+        print(f"No loss history files found in {results_dir}")
+        return
+    
+    print(f"Found {len(loss_files)} loss history files")
+    
+    # Collect all loss histories
+    all_train = []
+    all_val = []
+    all_train_data = []
+    all_train_rc = []
+    all_train_comfort = []
+    all_train_smooth = []
+    max_epochs = 0
+    
+    for loss_file in loss_files:
+        with open(loss_file, 'r') as f:
+            loss_history = json.load(f)
+        
+        epochs = loss_history['epoch']
+        
+        if isinstance(loss_history['train'], list):
+            train_losses = loss_history['train']
+            val_losses = loss_history['val']
+        else:
+            train_losses = loss_history['train']['total']
+            val_losses = loss_history['val']['total']
+            if 'data' in loss_history['train']:
+                all_train_data.append(loss_history['train']['data'])
+                all_train_rc.append(loss_history['train']['rc'])
+                all_train_comfort.append(loss_history['train']['comfort'])
+                all_train_smooth.append(loss_history['train']['smooth'])
+        
+        max_epochs = max(max_epochs, len(epochs))
+        all_train.append(train_losses)
+        all_val.append(val_losses)
+    
+    # Pad to same length
+    for i in range(len(all_train)):
+        if len(all_train[i]) < max_epochs:
+            # Repeat last value
+            last_train = all_train[i][-1]
+            last_val = all_val[i][-1]
+            all_train[i].extend([last_train] * (max_epochs - len(all_train[i])))
+            all_val[i].extend([last_val] * (max_epochs - len(all_val[i])))
+            if all_train_data:
+                all_train_data[i].extend([all_train_data[i][-1]] * (max_epochs - len(all_train_data[i])))
+                all_train_rc[i].extend([all_train_rc[i][-1]] * (max_epochs - len(all_train_rc[i])))
+                all_train_comfort[i].extend([all_train_comfort[i][-1]] * (max_epochs - len(all_train_comfort[i])))
+                all_train_smooth[i].extend([all_train_smooth[i][-1]] * (max_epochs - len(all_train_smooth[i])))
+    
+    # Convert to numpy arrays
+    all_train = np.array(all_train)
+    all_val = np.array(all_val)
+    
+    # Compute mean and std
+    train_mean = np.mean(all_train, axis=0)
+    train_std = np.std(all_train, axis=0)
+    val_mean = np.mean(all_val, axis=0)
+    val_std = np.std(all_val, axis=0)
+    
+    epochs = np.arange(max_epochs)
+    
+    # Plot
+    if all_train_data:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # Total loss
+        ax = axes[0, 0]
+        ax.plot(epochs, train_mean, 'o-', label='Training Loss (mean)', linewidth=2, markersize=4)
+        ax.fill_between(epochs, train_mean - train_std, train_mean + train_std, alpha=0.3)
+        ax.plot(epochs, val_mean, 's-', label='Validation Loss (mean)', linewidth=2, markersize=4)
+        ax.fill_between(epochs, val_mean - val_std, val_mean + val_std, alpha=0.3)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Total Loss')
+        ax.set_title(f'Total Loss (aggregated across {len(loss_files)} buildings)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Loss components
+        all_train_data = np.array(all_train_data)
+        all_train_rc = np.array(all_train_rc)
+        all_train_comfort = np.array(all_train_comfort)
+        all_train_smooth = np.array(all_train_smooth)
+        
+        ax = axes[0, 1]
+        ax.plot(epochs, np.mean(all_train_data, axis=0), 'o-', label='Data', linewidth=1.5, markersize=3)
+        ax.plot(epochs, np.mean(all_train_rc, axis=0), 's-', label='RC', linewidth=1.5, markersize=3)
+        ax.plot(epochs, np.mean(all_train_comfort, axis=0), '^-', label='Comfort', linewidth=1.5, markersize=3)
+        ax.plot(epochs, np.mean(all_train_smooth, axis=0), 'v-', label='Smooth', linewidth=1.5, markersize=3)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss Component')
+        ax.set_title('Training Loss Components (mean)')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        ax.set_yscale('log')
+        
+        # Individual building curves (sample)
+        ax = axes[1, 0]
+        for i in range(min(5, len(all_train))):
+            ax.plot(epochs, all_train[i], alpha=0.3, linewidth=1)
+        ax.plot(epochs, train_mean, 'o-', label='Mean', linewidth=2, markersize=4, color='black')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Training Loss')
+        ax.set_title('Individual Building Curves (sample)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Validation curves
+        ax = axes[1, 1]
+        for i in range(min(5, len(all_val))):
+            ax.plot(epochs, all_val[i], alpha=0.3, linewidth=1)
+        ax.plot(epochs, val_mean, 's-', label='Mean', linewidth=2, markersize=4, color='black')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Validation Loss')
+        ax.set_title('Individual Building Curves (sample)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+    else:
+        # Simple aggregated plot
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, train_mean, 'o-', label='Training Loss (mean)', linewidth=2, markersize=4)
+        plt.fill_between(epochs, train_mean - train_std, train_mean + train_std, alpha=0.3)
+        plt.plot(epochs, val_mean, 's-', label='Validation Loss (mean)', linewidth=2, markersize=4)
+        plt.fill_between(epochs, val_mean - val_std, val_mean + val_std, alpha=0.3)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title(f'Training and Validation Loss (aggregated across {len(loss_files)} buildings)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved aggregated plot to {save_path}")
+    else:
+        plt.show()
+
+
 def plot_building_type_comparison(lgbm_df: pd.DataFrame, pinn_df: pd.DataFrame,
                                   metric: str = 'cvrmse', save_path: Path = None):
     """Plot comparison by building type."""
@@ -251,18 +495,44 @@ def main():
     parser.add_argument('--metric', type=str, default='cvrmse',
                        choices=['cvrmse', 'mae', 'rmse', 'mape'],
                        help='Metric to plot')
+    parser.add_argument('--plot_losses', action='store_true',
+                       help='Plot training loss curves from JSON files')
+    parser.add_argument('--loss_json', type=str, default=None,
+                       help='Path to a specific loss history JSON file (if plotting single building)')
+    parser.add_argument('--results_dir', type=str, default='results/',
+                       help='Directory containing loss history JSON files (for aggregated plots)')
     
     args = parser.parse_args()
-    
-    # Load data
-    lgbm_df = pd.read_csv(args.lightgbm_file)
-    pinn_df = pd.read_csv(args.pinn_file)
-    
-    print(f"Loaded {len(lgbm_df)} LightGBM records and {len(pinn_df)} PINN records")
     
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Plot loss curves from JSON files
+    if args.plot_losses:
+        if args.loss_json:
+            # Plot single building
+            print(f"\nPlotting loss curves from {args.loss_json}...")
+            plot_loss_curves_from_json(
+                Path(args.loss_json),
+                save_path=output_dir / f'{Path(args.loss_json).stem}_losses.png',
+                plot_components=True
+            )
+        else:
+            # Plot aggregated losses
+            print(f"\nPlotting aggregated loss curves from {args.results_dir}...")
+            plot_aggregated_losses_from_json(
+                Path(args.results_dir),
+                save_path=output_dir / 'aggregated_training_losses.png'
+            )
+        print(f"\nLoss plots saved to {output_dir}/")
+        return
+    
+    # Load CSV data for metrics comparison
+    lgbm_df = pd.read_csv(args.lightgbm_file)
+    pinn_df = pd.read_csv(args.pinn_file)
+    
+    print(f"Loaded {len(lgbm_df)} LightGBM records and {len(pinn_df)} PINN records")
     
     # Plot 1: Overall comparison
     print(f"\nPlotting {args.metric.upper()} comparison...")
