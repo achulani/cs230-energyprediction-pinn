@@ -226,8 +226,9 @@ def main():
     parser.add_argument(
         "--benchmark",
         type=str,
-        default="buildings-100",
-        help="BuildingsBench benchmark name (e.g. 'buildings-100').",
+        default="sceaux",
+        help="BuildingsBench benchmark name. Available: 'sceaux', 'electricity', 'bdg-2', 
+        'borealis', 'smart', 'ideal', 'lcl', 'buildings-900k-test'.",
     )
     parser.add_argument(
         "--building_id",
@@ -273,8 +274,9 @@ def main():
     args = parser.parse_args()
 
     results_dir = Path(args.results_dir)
-    results_path = results_dir / f"grid_results_{args.benchmark}.csv"
-    best_params_path = results_dir / f"best_params_{args.benchmark}.json"
+    benchmark_name = args.benchmark.replace('-', '_')  # Convert dashes to underscores for filenames
+    results_path = results_dir / f"grid_results_{benchmark_name}.csv"
+    best_params_path = results_dir / f"best_params_{benchmark_name}.json"
 
     print(f"[INFO] Loading data from benchmark='{args.benchmark}'")
     bldg_df, building_name = load_building_data(
