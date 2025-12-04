@@ -227,8 +227,7 @@ def main():
         "--benchmark",
         type=str,
         default="sceaux",
-        help="BuildingsBench benchmark name. Available: 'sceaux', 'electricity', 'bdg-2', 
-        'borealis', 'smart', 'ideal', 'lcl', 'buildings-900k-test'.",
+        help="BuildingsBench benchmark name. Available: 'sceaux', 'electricity', 'bdg-2', 'borealis', 'smart', 'ideal', 'lcl', 'buildings-900k-test'.",
     )
     parser.add_argument(
         "--building_id",
