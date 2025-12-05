@@ -1,0 +1,51 @@
+[model]
+architecture = 'transformer'
+input_dim = 50  # Will be determined dynamically
+d_model = 128
+nhead = 8
+num_encoder_layers = 2
+num_decoder_layers = 2
+dim_feedforward = 256
+dropout = 0.1
+context_len = 168
+pred_len = 24
+
+[training]
+batch_size = 16
+lr = 0.001
+finetune_lr = 0.0001
+max_epochs = 25
+min_epochs = 0
+patience = 5
+weight_decay = 1e-5
+max_grad_norm = 1.0
+optimizer = 'adamw'
+scheduler_type = 'cosine_restarts'
+scheduler_T_0 = 10
+scheduler_T_mult = 2
+use_mixed_precision = true
+gradient_accumulation_steps = 1
+use_adaptive_grad_clip = false
+adaptive_clip_value = 0.01
+
+[features]
+use_temporal_embeddings = true
+use_context_stats = true
+use_feature_interactions = true
+include_lgbm_as_feature = false
+temporal_embedding_dim = 32
+
+[loss]
+lambda_rc = 1.0
+lambda_comfort = 0.1
+lambda_smooth = 0.01
+use_rc_loss = true
+use_comfort_loss = true
+use_smooth_loss = true
+use_adaptive_weights = false
+use_focal_loss = false
+focal_alpha = 1.0
+focal_gamma = 2.0
+use_quantile_loss = false
+data_loss_type = 'mse'
+

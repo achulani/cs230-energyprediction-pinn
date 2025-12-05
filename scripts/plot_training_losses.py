@@ -177,54 +177,156 @@ def plot_aggregated_losses(results_dir: Path, save_path: Path = None):
         print(f"No loss history files found in {results_dir}")
         return
     
-    # Collect all loss histories
-    all_train = []
-    all_val = []
-    max_epochs = 0
+    # First pass: collect all losses to compute global outlier thresholds
+    all_train_values = []
+    all_val_values = []
     
     for loss_file in loss_files:
-        with open(loss_file, 'r') as f:
-            loss_history = json.load(f)
-        
-        epochs = loss_history['epoch']
-        if isinstance(loss_history['train'], list):
-            train_losses = loss_history['train']
-            val_losses = loss_history['val']
-        else:
-            train_losses = loss_history['train']['total']
-            val_losses = loss_history['val']['total']
-        
-        max_epochs = max(max_epochs, len(epochs))
-        all_train.append(train_losses)
-        all_val.append(val_losses)
+        try:
+            with open(loss_file, 'r') as f:
+                loss_history = json.load(f)
+            
+            if isinstance(loss_history['train'], list):
+                train_losses = np.array(loss_history['train'])
+                val_losses = np.array(loss_history['val'])
+            else:
+                train_losses = np.array(loss_history['train']['total'])
+                val_losses = np.array(loss_history['val']['total'])
+            
+            # Collect valid values
+            valid_train = train_losses[np.isfinite(train_losses) & (train_losses > 0)]
+            valid_val = val_losses[np.isfinite(val_losses) & (val_losses > 0)]
+            
+            if len(valid_train) > 0:
+                all_train_values.extend(valid_train.tolist())
+            if len(valid_val) > 0:
+                all_val_values.extend(valid_val.tolist())
+        except Exception:
+            continue
     
-    # Pad to same length
-    for i in range(len(all_train)):
-        if len(all_train[i]) < max_epochs:
-            # Repeat last value
-            last_train = all_train[i][-1]
-            last_val = all_val[i][-1]
-            all_train[i].extend([last_train] * (max_epochs - len(all_train[i])))
-            all_val[i].extend([last_val] * (max_epochs - len(all_val[i])))
+    # Compute global outlier thresholds using robust method
+    # Use 95th percentile as base, then cap at reasonable maximum
+    if len(all_train_values) > 0:
+        train_95th = np.percentile(all_train_values, 95)
+        # Cap at 10x the 95th percentile, but never more than 1e7 (10 million)
+        max_train = min(1e7, max(1e6, train_95th * 10))
+    else:
+        max_train = 1e7
+    
+    if len(all_val_values) > 0:
+        val_95th = np.percentile(all_val_values, 95)
+        # Cap at 10x the 95th percentile, but never more than 1e7 (10 million)
+        max_val = min(1e7, max(1e6, val_95th * 10))
+    else:
+        max_val = 1e7
+    
+    # Second pass: collect losses with their epoch numbers, filtering outliers
+    all_train_data = []  # List of (epochs, losses) tuples
+    all_val_data = []    # List of (epochs, losses) tuples
+    
+    for loss_file in loss_files:
+        try:
+            with open(loss_file, 'r') as f:
+                loss_history = json.load(f)
+            
+            epochs = np.array(loss_history['epoch'])
+            if isinstance(loss_history['train'], list):
+                train_losses = np.array(loss_history['train'])
+                val_losses = np.array(loss_history['val'])
+            else:
+                train_losses = np.array(loss_history['train']['total'])
+                val_losses = np.array(loss_history['val']['total'])
+            
+            # Filter out invalid values and extreme outliers
+            valid_mask = (np.isfinite(train_losses) & (train_losses > 0) & (train_losses < max_train) &
+                          np.isfinite(val_losses) & (val_losses > 0) & (val_losses < max_val))
+            if np.sum(valid_mask) == 0:
+                continue
+            
+            valid_epochs = epochs[valid_mask]
+            valid_train = train_losses[valid_mask]
+            valid_val = val_losses[valid_mask]
+            
+            all_train_data.append((valid_epochs, valid_train))
+            all_val_data.append((valid_epochs, valid_val))
+        except Exception as e:
+            continue
+    
+    if len(all_train_data) == 0:
+        print("No valid loss data found")
+        return
+    
+    # Find the common epoch range across all files
+    all_epochs = set()
+    for epochs, _ in all_train_data:
+        all_epochs.update(epochs)
+    all_epochs = sorted(all_epochs)
+    
+    if len(all_epochs) == 0:
+        print("No valid epochs found")
+        return
+    
+    # Interpolate all curves to common epoch grid
+    epoch_grid = np.array(all_epochs)
+    interpolated_train = []
+    interpolated_val = []
+    
+    for (epochs, train_losses), (_, val_losses) in zip(all_train_data, all_val_data):
+        # Interpolate to common grid (forward fill for missing values)
+        train_interp = np.interp(epoch_grid, epochs, train_losses, 
+                                 left=train_losses[0] if len(train_losses) > 0 else np.nan,
+                                 right=train_losses[-1] if len(train_losses) > 0 else np.nan)
+        val_interp = np.interp(epoch_grid, epochs, val_losses,
+                               left=val_losses[0] if len(val_losses) > 0 else np.nan,
+                               right=val_losses[-1] if len(val_losses) > 0 else np.nan)
+        
+        # Filter out NaN values
+        valid_mask = np.isfinite(train_interp) & np.isfinite(val_interp)
+        if np.any(valid_mask):
+            interpolated_train.append(train_interp)
+            interpolated_val.append(val_interp)
+    
+    if len(interpolated_train) == 0:
+        print("No valid interpolated data found")
+        return
     
     # Convert to numpy arrays
-    all_train = np.array(all_train)
-    all_val = np.array(all_val)
+    interpolated_train = np.array(interpolated_train)
+    interpolated_val = np.array(interpolated_val)
     
     # Compute mean and std
-    train_mean = np.mean(all_train, axis=0)
-    train_std = np.std(all_train, axis=0)
-    val_mean = np.mean(all_val, axis=0)
-    val_std = np.std(all_val, axis=0)
+    train_mean = np.nanmean(interpolated_train, axis=0)
+    train_std = np.nanstd(interpolated_train, axis=0)
+    val_mean = np.nanmean(interpolated_val, axis=0)
+    val_std = np.nanstd(interpolated_val, axis=0)
     
-    epochs = np.arange(max_epochs)
+    # Filter out NaN means
+    valid_mask = np.isfinite(train_mean) & np.isfinite(val_mean)
+    epoch_grid = epoch_grid[valid_mask]
+    train_mean = train_mean[valid_mask]
+    train_std = train_std[valid_mask]
+    val_mean = val_mean[valid_mask]
+    val_std = val_std[valid_mask]
+    
+    if len(epoch_grid) == 0:
+        print("No valid data after filtering")
+        return
+    
+    # Plot with log scale if losses are very large
+    use_log_scale = np.max(train_mean) > 1000 or np.max(val_mean) > 1000
     
     # Plot
     plt.figure(figsize=(10, 6))
-    plt.plot(epochs, train_mean, 'o-', label='Training Loss (mean)', linewidth=2, markersize=4)
-    plt.fill_between(epochs, train_mean - train_std, train_mean + train_std, alpha=0.3)
-    plt.plot(epochs, val_mean, 's-', label='Validation Loss (mean)', linewidth=2, markersize=4)
-    plt.fill_between(epochs, val_mean - val_std, val_mean + val_std, alpha=0.3)
+    plt.plot(epoch_grid, train_mean, 'o-', label='Training Loss (mean)', linewidth=2, markersize=4)
+    plt.fill_between(epoch_grid, train_mean - train_std, train_mean + train_std, alpha=0.3)
+    plt.plot(epoch_grid, val_mean, 's-', label='Validation Loss (mean)', linewidth=2, markersize=4)
+    plt.fill_between(epoch_grid, val_mean - val_std, val_mean + val_std, alpha=0.3)
+    
+    if use_log_scale:
+        plt.yscale('log')
+        plt.ylabel('Loss (log scale)')
+    else:
+        plt.ylabel('Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.title(f'Training and Validation Loss (aggregated across {len(loss_files)} buildings)')

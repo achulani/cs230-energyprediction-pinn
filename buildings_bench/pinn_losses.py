@@ -220,18 +220,67 @@ def smoothness_loss(y_hat: torch.Tensor) -> torch.Tensor:
     return torch.mean(d2y ** 2)
 
 
+def focal_mse_loss(pred: torch.Tensor, target: torch.Tensor, alpha: float = 1.0, gamma: float = 2.0) -> torch.Tensor:
+    """Focal MSE loss that focuses on difficult-to-predict samples.
+    
+    Args:
+        pred: Predictions
+        target: Targets
+        alpha: Weighting factor
+        gamma: Focusing parameter (higher = more focus on hard examples)
+    
+    Returns:
+        Focal MSE loss
+    """
+    mse = (pred - target) ** 2
+    # Weight by error magnitude (harder examples get more weight)
+    weights = (mse / (mse.mean() + 1e-8)) ** gamma
+    return alpha * torch.mean(weights * mse)
+
+
+def quantile_loss(pred: torch.Tensor, target: torch.Tensor, quantiles: list = [0.1, 0.5, 0.9]) -> torch.Tensor:
+    """Quantile loss for uncertainty estimation.
+    
+    Args:
+        pred: Predictions (can be single value or quantile predictions)
+        target: Targets
+        quantiles: List of quantiles to predict
+    
+    Returns:
+        Quantile loss
+    """
+    if pred.dim() == 2 and pred.shape[-1] == len(quantiles):
+        # Multi-quantile prediction
+        losses = []
+        for i, q in enumerate(quantiles):
+            error = target - pred[:, i]
+            loss = torch.max(q * error, (q - 1) * error)
+            losses.append(loss)
+        return torch.mean(torch.stack(losses))
+    else:
+        # Single prediction - use median quantile
+        error = target - pred.squeeze()
+        return torch.mean(torch.max(0.5 * error, -0.5 * error))
+
+
 class PINNLoss(nn.Module):
-    """Combined PINN loss module for residual learning.
+    """Combined PINN loss module for residual learning with advanced features.
     
     Implements the physics-informed loss functions for hybrid LightGBM + PINN forecasting:
     
-    L_total = L_MSE + β_RC * L_RC + β_comfort * L_comfort + β_smooth * L_smooth
+    L_total = L_data + β_RC * L_RC + β_comfort * L_comfort + β_smooth * L_smooth
     
     Where:
-    1. L_MSE: Residual mean-squared error (data-fitting)
+    1. L_data: Data-fitting loss (MSE, Focal MSE, or Quantile)
     2. L_RC: Energy-balance loss from 1R1C thermal model
     3. L_comfort: Comfort-zone consistency loss
     4. L_smooth: Thermal-inertia smoothness loss (second-order derivative)
+    
+    Supports:
+    - Adaptive loss weighting (learnable weights)
+    - Focal loss for difficult samples
+    - Quantile loss for uncertainty estimation
+    - Loss balancing strategies
     
     Usage:
         loss_fn = PINNLoss(metadata, lambda_rc=1.0, lambda_comfort=0.1, lambda_smooth=0.01)
@@ -248,7 +297,13 @@ class PINNLoss(nn.Module):
         T0: float = 22.0,
         use_rc_loss: bool = True,
         use_comfort_loss: bool = True,
-        use_smooth_loss: bool = True
+        use_smooth_loss: bool = True,
+        use_adaptive_weights: bool = False,
+        use_focal_loss: bool = False,
+        focal_alpha: float = 1.0,
+        focal_gamma: float = 2.0,
+        use_quantile_loss: bool = False,
+        data_loss_type: str = 'mse'  # 'mse', 'focal_mse', 'quantile', 'huber'
     ):
         """Initialize PINN loss.
         
@@ -262,6 +317,12 @@ class PINNLoss(nn.Module):
             use_rc_loss: Whether to include RC circuit loss. Default: True
             use_comfort_loss: Whether to include comfort loss. Default: True
             use_smooth_loss: Whether to include smoothness loss. Default: True
+            use_adaptive_weights: Whether to use learnable adaptive weights. Default: False
+            use_focal_loss: Whether to use focal loss for data fitting. Default: False
+            focal_alpha: Focal loss alpha parameter. Default: 1.0
+            focal_gamma: Focal loss gamma parameter. Default: 2.0
+            use_quantile_loss: Whether to use quantile loss. Default: False
+            data_loss_type: Type of data loss ('mse', 'focal_mse', 'quantile', 'huber'). Default: 'mse'
         """
         super().__init__()
         
@@ -273,11 +334,21 @@ class PINNLoss(nn.Module):
         self.register_buffer('R', torch.tensor(R, dtype=torch.float32))
         self.register_buffer('T_set', torch.tensor(T_set, dtype=torch.float32))
         self.register_buffer('deltaT', torch.tensor(deltaT, dtype=torch.float32))
-        self.register_buffer('lambda_rc', torch.tensor(lambda_rc, dtype=torch.float32))
-        self.register_buffer('lambda_comfort', torch.tensor(lambda_comfort, dtype=torch.float32))
-        self.register_buffer('lambda_smooth', torch.tensor(lambda_smooth, dtype=torch.float32))
         self.register_buffer('dt', torch.tensor(dt, dtype=torch.float32))
         self.register_buffer('T0', torch.tensor(T0, dtype=torch.float32))
+        
+        # Adaptive loss weights (learnable)
+        self.use_adaptive_weights = use_adaptive_weights
+        if use_adaptive_weights:
+            # Initialize with log-space for stability
+            self.log_lambda_rc = nn.Parameter(torch.tensor(np.log(lambda_rc + 1e-8)))
+            self.log_lambda_comfort = nn.Parameter(torch.tensor(np.log(lambda_comfort + 1e-8)))
+            self.log_lambda_smooth = nn.Parameter(torch.tensor(np.log(lambda_smooth + 1e-8)))
+        else:
+            # Fixed weights
+            self.register_buffer('lambda_rc', torch.tensor(lambda_rc, dtype=torch.float32))
+            self.register_buffer('lambda_comfort', torch.tensor(lambda_comfort, dtype=torch.float32))
+            self.register_buffer('lambda_smooth', torch.tensor(lambda_smooth, dtype=torch.float32))
         
         # Store as Python floats for use in functions
         self.C_val = C
@@ -291,6 +362,11 @@ class PINNLoss(nn.Module):
         self.use_rc_loss = use_rc_loss
         self.use_comfort_loss = use_comfort_loss
         self.use_smooth_loss = use_smooth_loss
+        self.use_focal_loss = use_focal_loss
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
+        self.use_quantile_loss = use_quantile_loss
+        self.data_loss_type = data_loss_type
     
     def forward(
         self,
@@ -310,8 +386,31 @@ class PINNLoss(nn.Module):
         Returns:
             Total loss (scalar), or tuple of (total_loss, loss_dict) if return_components=True
         """
-        # Data loss
-        L_data = torch.mean((y_hat - y_true) ** 2)
+        # Data loss with different formulations
+        # Normalize by target variance to make loss scale-invariant across buildings
+        # Use a more robust normalization to prevent explosion
+        target_var = torch.var(y_true)
+        target_mean_abs = torch.mean(torch.abs(y_true))
+        
+        # Use a combination of variance and mean for more stable normalization
+        # This prevents explosion when variance is very small
+        # Set minimum floor to prevent extreme normalization (prevents explosion)
+        normalization_factor = torch.clamp(target_var, min=1e-4) + 0.1 * (target_mean_abs ** 2)
+        normalization_factor = torch.clamp(normalization_factor, min=0.1)  # Minimum floor to prevent explosion
+        
+        # Compute raw data loss first
+        if self.data_loss_type == 'focal_mse' or self.use_focal_loss:
+            L_data_raw = focal_mse_loss(y_hat, y_true, self.focal_alpha, self.focal_gamma)
+        elif self.data_loss_type == 'quantile' or self.use_quantile_loss:
+            L_data_raw = quantile_loss(y_hat, y_true)
+        elif self.data_loss_type == 'huber':
+            L_data_raw = nn.functional.smooth_l1_loss(y_hat, y_true)
+        else:
+            # Standard MSE
+            L_data_raw = torch.mean((y_hat - y_true) ** 2)
+        
+        # Normalize by robust normalization factor
+        L_data = L_data_raw / normalization_factor
         
         # Infer indoor temperature
         T_hat = infer_temperature(
@@ -320,6 +419,9 @@ class PINNLoss(nn.Module):
         
         # RC circuit loss (only compute if enabled)
         L_rc = rc_loss(T_hat, y_hat, T_out, self.C_val, self.R_val, self.dt_val) if self.use_rc_loss else torch.tensor(0.0, device=y_hat.device)
+        # Clip RC loss to prevent explosion
+        if self.use_rc_loss:
+            L_rc = torch.clamp(L_rc, max=1e6)  # Cap RC loss to prevent extreme values
         
         # Comfort violation loss (only compute if enabled)
         L_comfort = comfort_loss(T_hat, self.T_set_val, self.deltaT_val) if self.use_comfort_loss else torch.tensor(0.0, device=y_hat.device)
@@ -327,23 +429,72 @@ class PINNLoss(nn.Module):
         # Smoothness loss (only compute if enabled)
         L_smooth = smoothness_loss(y_hat) if self.use_smooth_loss else torch.tensor(0.0, device=y_hat.device)
         
-        # Combined loss
+        # Normalize physics losses by their scale to prevent dominance
+        # Use the same robust normalization factor for consistency
+        if self.use_rc_loss:
+            L_rc_norm = L_rc / normalization_factor if L_rc.item() > 0 else L_rc
+            # Clip normalized RC loss more aggressively to prevent dominance
+            # Even after normalization, RC loss can be huge and dominate training
+            L_rc_norm = torch.clamp(L_rc_norm, max=100.0)  # Cap normalized RC loss to prevent dominance
+        else:
+            L_rc_norm = torch.tensor(0.0, device=y_hat.device)
+        
+        if self.use_comfort_loss:
+            L_comfort_norm = L_comfort / normalization_factor if L_comfort.item() > 0 else L_comfort
+        else:
+            L_comfort_norm = torch.tensor(0.0, device=y_hat.device)
+        
+        if self.use_smooth_loss:
+            L_smooth_norm = L_smooth / normalization_factor if L_smooth.item() > 0 else L_smooth
+        else:
+            L_smooth_norm = torch.tensor(0.0, device=y_hat.device)
+        
+        # Get loss weights (adaptive or fixed)
+        if self.use_adaptive_weights:
+            lambda_rc = torch.exp(self.log_lambda_rc)
+            lambda_comfort = torch.exp(self.log_lambda_comfort)
+            lambda_smooth = torch.exp(self.log_lambda_smooth)
+        else:
+            lambda_rc = self.lambda_rc
+            lambda_comfort = self.lambda_comfort
+            lambda_smooth = self.lambda_smooth
+        
+        # Combined loss with normalized components
         total_loss = L_data
         if self.use_rc_loss:
-            total_loss = total_loss + self.lambda_rc * L_rc
+            total_loss = total_loss + lambda_rc * L_rc_norm
         if self.use_comfort_loss:
-            total_loss = total_loss + self.lambda_comfort * L_comfort
+            total_loss = total_loss + lambda_comfort * L_comfort_norm
         if self.use_smooth_loss:
-            total_loss = total_loss + self.lambda_smooth * L_smooth
+            total_loss = total_loss + lambda_smooth * L_smooth_norm
+        
+        # Check for NaN/Inf and clip to prevent explosion
+        if not torch.isfinite(total_loss):
+            # If loss is NaN/Inf, use a large but finite value to prevent training crash
+            total_loss = torch.clamp(total_loss, min=-1e8, max=1e8)
+            if torch.isnan(total_loss):
+                total_loss = torch.tensor(1e6, device=y_hat.device, dtype=y_hat.dtype)
+        else:
+            # Clip total loss to prevent extreme values
+            total_loss = torch.clamp(total_loss, max=1e8)
         
         if return_components:
+            # Return both normalized (for training) and raw (for interpretation) losses
             loss_dict = {
-                'data': L_data.item(),
-                'rc': L_rc.item(),
-                'comfort': L_comfort.item(),
-                'smooth': L_smooth.item(),
-                'total': total_loss.item()
+                'data': L_data.item(),  # Normalized
+                'data_raw': L_data_raw.item(),  # Raw MSE
+                'rc': L_rc_norm.item() if self.use_rc_loss else 0.0,  # Normalized
+                'rc_raw': L_rc.item() if self.use_rc_loss else 0.0,  # Raw
+                'comfort': L_comfort_norm.item() if self.use_comfort_loss else 0.0,  # Normalized
+                'comfort_raw': L_comfort.item() if self.use_comfort_loss else 0.0,  # Raw
+                'smooth': L_smooth_norm.item() if self.use_smooth_loss else 0.0,  # Normalized
+                'smooth_raw': L_smooth.item() if self.use_smooth_loss else 0.0,  # Raw
+                'total': total_loss.item()  # Total normalized loss
             }
+            if self.use_adaptive_weights:
+                loss_dict['lambda_rc'] = lambda_rc.item()
+                loss_dict['lambda_comfort'] = lambda_comfort.item()
+                loss_dict['lambda_smooth'] = lambda_smooth.item()
             return total_loss, loss_dict
         
         return total_loss
