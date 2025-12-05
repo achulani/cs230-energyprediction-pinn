@@ -55,11 +55,13 @@ def global_lightgbm(args, results_path: Path):
     building_test_data = {}
     building_info = {}
     
-    # Encode building IDs
-    building_encoder = LabelEncoder()
+    # Track building IDs
     all_building_ids = []
+    building_id_counter = 0
 
     for dataset_name in args.benchmark:
+        print(f"\nProcessing dataset: {dataset_name}")
+        
         dataset_generator = load_pandas_dataset(
             dataset_name,
             feature_set='engineered',
@@ -79,14 +81,15 @@ def global_lightgbm(args, results_path: Path):
                   f"defaulting to residential")
             building_type = BuildingTypes.RESIDENTIAL
 
+        building_count = 0
         for building_name, bldg_df in dataset_generator:
             
             # Require minimum data
             if len(bldg_df) < (args.num_training_days + 30) * 24:
-                print(f'{dataset_name} {building_name} has too few days {len(bldg_df)}')
+                print(f'  SKIP: {dataset_name}/{building_name} - too few days ({len(bldg_df)//24} days)')
                 continue
 
-            print(f'Collecting data from {dataset_name} {building_name}')
+            print(f'  Collecting: {dataset_name}/{building_name} ({len(bldg_df)//24} days)')
             
             building_id = f"{dataset_name}_{building_name}"
             all_building_ids.append(building_id)
@@ -118,7 +121,9 @@ def global_lightgbm(args, results_path: Path):
             n = len(training_set)
 
             if n <= lag + 1:
-                print(f'{dataset_name} {building_name} has too few training samples')
+                print(f'    SKIP: too few training samples after lag ({n} samples)')
+                all_building_ids.pop()  # Remove from list
+                del building_info[building_id]
                 continue
 
             X_rows = []
@@ -134,8 +139,9 @@ def global_lightgbm(args, results_path: Path):
             X = np.vstack(X_rows)
             y = np.array(y_vals)
 
-            # Add building ID as a feature (will be encoded later)
-            building_id_col = np.full((len(X), 1), building_id, dtype=object)
+            # Add building ID as a numerical feature (sequential counter)
+            building_id_col = np.full((len(X), 1), building_id_counter, dtype=float)
+            building_id_counter += 1
 
             # Split into train/val (last 30 days for validation)
             max_val_hours = 30 * 24
@@ -163,20 +169,31 @@ def global_lightgbm(args, results_path: Path):
             # Store test data for later evaluation
             building_test_data[building_id] = {
                 'test_set': test_set,
-                'feature_cols': feature_cols
+                'feature_cols': feature_cols,
+                'building_id_encoded': building_id_counter - 1  # Store the numerical ID
             }
 
             metrics_manager.add_building_to_dataset_if_missing(
                 dataset_name, f'{building_name}'
             )
+            
+            building_count += 1
+        
+        print(f"  Collected {building_count} buildings from {dataset_name}")
 
     # ------------------------------------------------------------------
-    # Phase 2: Encode building IDs and prepare global training set
+    # Phase 2: Check if we have data, then prepare global training set
     # ------------------------------------------------------------------
     print("\nPhase 2: Preparing global training set...")
     
-    # Fit encoder on all building IDs
-    building_encoder.fit(all_building_ids)
+    if len(all_X_train) == 0:
+        print("ERROR: No buildings collected! Check your data paths and filters.")
+        print(f"  - Target buildings filter active: {not args.dont_subsample_buildings}")
+        print(f"  - Datasets attempted: {args.benchmark}")
+        print(f"  - Minimum days required: {args.num_training_days + 30}")
+        return
+    
+    print(f"Successfully collected data from {len(all_building_ids)} buildings")
     
     # Concatenate all training data
     X_train_global = np.vstack(all_X_train)
@@ -184,15 +201,7 @@ def global_lightgbm(args, results_path: Path):
     X_val_global = np.vstack(all_X_val)
     y_val_global = np.concatenate(all_y_val)
     
-    # Encode building IDs (last column)
-    X_train_global[:, -1] = building_encoder.transform(X_train_global[:, -1])
-    X_val_global[:, -1] = building_encoder.transform(X_val_global[:, -1])
-    
-    # Convert to float
-    X_train_global = X_train_global.astype(float)
-    X_val_global = X_val_global.astype(float)
-    
-    print(f"Global training set: {X_train_global.shape[0]} samples")
+    print(f"Global training set: {X_train_global.shape[0]} samples, {X_train_global.shape[1]} features")
     print(f"Global validation set: {X_val_global.shape[0]} samples")
     print(f"Number of buildings: {len(all_building_ids)}")
 
@@ -245,8 +254,9 @@ def global_lightgbm(args, results_path: Path):
         dataset_name = building_info[building_id]['dataset_name']
         building_name = building_info[building_id]['building_name']
         building_type = building_info[building_id]['building_type']
+        building_id_encoded = test_info['building_id_encoded']
         
-        print(f'Testing on {dataset_name} {building_name}')
+        print(f'Testing on {dataset_name}/{building_name}')
         
         test_set = test_info['test_set']
         feature_cols = test_info['feature_cols']
@@ -261,13 +271,10 @@ def global_lightgbm(args, results_path: Path):
                 BuildingTypes.RESIDENTIAL_INT * torch.ones([1, 24, 1])
             ).bool()
         
-        # Encode this building's ID
-        building_id_encoded = building_encoder.transform([building_id])[0]
-        
         # Forecasting using autoregressive approach
         pred_days = (len(test_set) - lag - 24) // 24
         if pred_days <= 0:
-            print(f'{building_id} has too few test samples for prediction windows.')
+            print(f'  SKIP: too few test samples')
             continue
 
         for i in range(pred_days):
@@ -338,11 +345,11 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--dont_subsample_buildings', action='store_true', default=False,
-        help='Evaluate on all instead of a subsample.'
+        help='Evaluate on all instead of a subsample'
     )
     parser.add_argument(
         '--use_temperature_input', action='store_true',
-        help='Include temperature as an additional feature.'
+        help='Include temperature as an additional feature'
     )
 
     args = parser.parse_args()
