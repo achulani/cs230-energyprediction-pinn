@@ -1,3 +1,18 @@
+"""
+Physics-Informed Neural Network (PINN) for Building Energy Forecasting
+
+Trains per-building LightGBM + PINN models with optional physics constraints:
+- Smoothness loss: Penalizes oscillations (thermal inertia)
+- Temporal gradient loss: Limits rate of change (HVAC ramp rates)
+- Weather consistency loss: Enforces temperature-power relationship
+
+Outputs:
+- Standard metrics CSV (CVRMSE, MAE)
+- Physics metrics JSON (aggregated)
+- Per-building physics metrics CSV
+- Loss curves (training plots)
+"""
+
 from pathlib import Path
 import os
 import argparse
@@ -20,7 +35,8 @@ from eval_metrics import (
     compute_physics_metrics, 
     aggregate_physics_metrics, 
     save_metrics_to_json,
-    print_metrics_summary
+    print_metrics_summary,
+    create_per_building_metrics_df
 )
 
 
@@ -54,6 +70,9 @@ def compute_smoothness_loss(predictions):
     """
     Temporal smoothness loss: penalizes rapid oscillations.
     L_smooth = Σ(ŷ_t - 2*ŷ_{t-1} + ŷ_{t-2})²
+    
+    Physical motivation: Buildings have thermal inertia - temperature 
+    and power consumption change gradually, not erratically.
     """
     if predictions.shape[0] < 3:
         return torch.tensor(0.0, device=predictions.device)
@@ -62,24 +81,16 @@ def compute_smoothness_loss(predictions):
     return torch.mean(second_diff ** 2)
 
 
-def compute_peak_pattern_loss(predictions, hour_features):
+def compute_temporal_gradient_loss(predictions, max_gradient=0.3):
     """
-    Peak load pattern loss: penalizes unrealistic daily peak patterns.
-    """
-    # Compute variance of predictions (should have clear peaks, not flat)
-    variance = torch.var(predictions)
-    flatness_penalty = torch.exp(-variance)  # Penalize flat predictions
+    Temporal gradient loss: limits hour-to-hour changes.
     
-    # Penalize negative predictions
-    negative_penalty = torch.mean(torch.relu(-predictions))
+    Physical motivation: HVAC systems have finite ramp rates - 
+    realistic power changes are typically <30% per hour.
     
-    return flatness_penalty + negative_penalty
-
-
-def compute_rate_of_change_loss(predictions, max_rate=0.3):
-    """
-    Rate of change loss: penalizes unrealistic hour-to-hour changes.
-    max_rate: maximum allowed fractional change per hour (default 30%)
+    Args:
+        predictions: (24,) tensor of predictions
+        max_gradient: maximum allowed fractional change per hour
     """
     if predictions.shape[0] < 2:
         return torch.tensor(0.0, device=predictions.device)
@@ -88,13 +99,56 @@ def compute_rate_of_change_loss(predictions, max_rate=0.3):
     changes = predictions[1:] - predictions[:-1]
     
     # Fractional change relative to mean prediction
-    mean_pred = torch.mean(predictions) + 1e-6  # Avoid division by zero
+    mean_pred = torch.mean(predictions) + 1e-6
     fractional_changes = torch.abs(changes) / mean_pred
     
-    # Penalize changes exceeding max_rate
-    violations = torch.relu(fractional_changes - max_rate)
+    # Penalize changes exceeding max_gradient
+    violations = torch.relu(fractional_changes - max_gradient)
     
     return torch.mean(violations ** 2)
+
+
+def compute_weather_consistency_loss(predictions, temperature, baseline_temp=20.0):
+    """
+    Weather consistency loss: ensures power responds appropriately to temperature.
+    
+    Physical motivation: Temperature drives HVAC loads - heating increases 
+    when cold, cooling increases when hot.
+    
+    Args:
+        predictions: (24,) tensor of power predictions
+        temperature: (24,) tensor of temperature forecasts
+        baseline_temp: baseline temperature (typically 20°C)
+    """
+    if temperature is None or len(temperature) == 0:
+        return torch.tensor(0.0, device=predictions.device)
+    
+    # Convert temperature to tensor if needed
+    if not isinstance(temperature, torch.Tensor):
+        temperature = torch.FloatTensor(temperature).to(predictions.device)
+    
+    # Temperature deviation from baseline (comfort temperature)
+    temp_deviation = torch.abs(temperature - baseline_temp)
+    
+    # Power should correlate with temperature deviation
+    # (more extreme temperatures = more heating/cooling needed)
+    power_mean = torch.mean(predictions)
+    power_std = torch.std(predictions) + 1e-6
+    
+    # Normalize predictions
+    power_normalized = (predictions - power_mean) / power_std
+    
+    # Normalize temperature deviations
+    temp_mean = torch.mean(temp_deviation)
+    temp_std = torch.std(temp_deviation) + 1e-6
+    temp_normalized = (temp_deviation - temp_mean) / temp_std
+    
+    # Correlation loss: penalize negative correlation
+    # (power should increase with temperature deviation)
+    correlation = torch.mean(power_normalized * temp_normalized)
+    
+    # Penalize if correlation is negative (anti-physical)
+    return torch.relu(-correlation) ** 2
 
 
 def prepare_pinn_input(lgbm_pred, weather_features, temporal_features, context_stats):
@@ -125,11 +179,18 @@ def prepare_pinn_input(lgbm_pred, weather_features, temporal_features, context_s
     
     # Weather features (flatten)
     if weather_features is not None and len(weather_features) > 0:
-        features.append(weather_features.flatten())
+        # If multi-dimensional, flatten
+        if weather_features.ndim > 1:
+            features.append(weather_features.flatten())
+        else:
+            features.append(weather_features)
     
     # Temporal features (flatten)
     if temporal_features is not None and len(temporal_features) > 0:
-        features.append(temporal_features.flatten())
+        if temporal_features.ndim > 1:
+            features.append(temporal_features.flatten())
+        else:
+            features.append(temporal_features)
     
     # Context statistics
     if context_stats is not None:
@@ -143,13 +204,28 @@ def prepare_pinn_input(lgbm_pred, weather_features, temporal_features, context_s
     return np.concatenate(features)
 
 
+def extract_temperature_from_features(exog_features):
+    """
+    Extract temperature from exogenous features.
+    Assumes temperature is the first feature if available.
+    """
+    if exog_features is not None and len(exog_features) > 0:
+        # If 2D array, take first column
+        if exog_features.ndim > 1 and exog_features.shape[1] > 0:
+            return exog_features[:, 0]
+        # If 1D array, return as is
+        elif exog_features.ndim == 1:
+            return exog_features
+    return None
+
+
 def train_pinn(pinn, train_data, val_data, args, device):
     """
     Train the PINN with physics-informed losses.
     
     Args:
         pinn: PhysicsInformedNN model
-        train_data: list of (input_features, lgbm_pred, ground_truth, temporal_features)
+        train_data: list of (input_features, lgbm_pred, ground_truth, weather, temporal)
         val_data: validation data in same format
         args: training arguments
         device: torch device
@@ -159,7 +235,7 @@ def train_pinn(pinn, train_data, val_data, args, device):
     """
     optimizer = optim.Adam(pinn.parameters(), lr=args.learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10, verbose=True
+        optimizer, mode='min', factor=0.5, patience=10, verbose=False
     )
     
     train_losses = []
@@ -175,10 +251,10 @@ def train_pinn(pinn, train_data, val_data, args, device):
         epoch_train_loss = 0
         epoch_train_mse = 0
         epoch_train_smooth = 0
-        epoch_train_peak = 0
-        epoch_train_roc = 0
+        epoch_train_temporal = 0
+        epoch_train_weather = 0
         
-        for input_features, lgbm_pred, ground_truth, temporal_features in train_data:
+        for input_features, lgbm_pred, ground_truth, weather, temporal in train_data:
             optimizer.zero_grad()
             
             # Forward pass
@@ -195,20 +271,29 @@ def train_pinn(pinn, train_data, val_data, args, device):
             # MSE loss (data fitting)
             mse_loss = nn.MSELoss()(hybrid_pred, gt_tensor)
             
-            # Physics losses
-            smooth_loss = compute_smoothness_loss(hybrid_pred)
-            peak_loss = compute_peak_pattern_loss(hybrid_pred, temporal_features)
-            roc_loss = compute_rate_of_change_loss(hybrid_pred)
+            # Physics losses (initialize as zero)
+            smooth_loss = torch.tensor(0.0, device=device)
+            temporal_loss = torch.tensor(0.0, device=device)
+            weather_loss = torch.tensor(0.0, device=device)
+            
+            if args.use_smoothness:
+                smooth_loss = compute_smoothness_loss(hybrid_pred)
+            
+            if args.use_temporal:
+                temporal_loss = compute_temporal_gradient_loss(hybrid_pred, max_gradient=args.max_gradient)
+            
+            if args.use_weather and weather is not None:
+                weather_loss = compute_weather_consistency_loss(hybrid_pred, weather)
             
             # Total loss with weights
             total_loss = mse_loss
             
             if args.use_smoothness:
                 total_loss += args.lambda_smooth * smooth_loss
-            if args.use_peak_pattern:
-                total_loss += args.lambda_peak * peak_loss
-            if args.use_rate_of_change:
-                total_loss += args.lambda_roc * roc_loss
+            if args.use_temporal:
+                total_loss += args.lambda_temporal * temporal_loss
+            if args.use_weather:
+                total_loss += args.lambda_weather * weather_loss
             
             total_loss.backward()
             optimizer.step()
@@ -216,14 +301,14 @@ def train_pinn(pinn, train_data, val_data, args, device):
             epoch_train_loss += total_loss.item()
             epoch_train_mse += mse_loss.item()
             epoch_train_smooth += smooth_loss.item()
-            epoch_train_peak += peak_loss.item()
-            epoch_train_roc += roc_loss.item()
+            epoch_train_temporal += temporal_loss.item()
+            epoch_train_weather += weather_loss.item()
         
         epoch_train_loss /= len(train_data)
         epoch_train_mse /= len(train_data)
         epoch_train_smooth /= len(train_data)
-        epoch_train_peak /= len(train_data)
-        epoch_train_roc /= len(train_data)
+        epoch_train_temporal /= len(train_data)
+        epoch_train_weather /= len(train_data)
         
         # Validation
         pinn.eval()
@@ -231,7 +316,7 @@ def train_pinn(pinn, train_data, val_data, args, device):
         epoch_val_mse = 0
         
         with torch.no_grad():
-            for input_features, lgbm_pred, ground_truth, temporal_features in val_data:
+            for input_features, lgbm_pred, ground_truth, weather, temporal in val_data:
                 input_tensor = torch.FloatTensor(input_features).unsqueeze(0).to(device)
                 residual_pred = pinn(input_tensor).squeeze(0)
                 
@@ -242,17 +327,24 @@ def train_pinn(pinn, train_data, val_data, args, device):
                 
                 mse_loss = nn.MSELoss()(hybrid_pred, gt_tensor)
                 
-                smooth_loss = compute_smoothness_loss(hybrid_pred)
-                peak_loss = compute_peak_pattern_loss(hybrid_pred, temporal_features)
-                roc_loss = compute_rate_of_change_loss(hybrid_pred)
+                smooth_loss = torch.tensor(0.0, device=device)
+                temporal_loss = torch.tensor(0.0, device=device)
+                weather_loss = torch.tensor(0.0, device=device)
+                
+                if args.use_smoothness:
+                    smooth_loss = compute_smoothness_loss(hybrid_pred)
+                if args.use_temporal:
+                    temporal_loss = compute_temporal_gradient_loss(hybrid_pred, max_gradient=args.max_gradient)
+                if args.use_weather and weather is not None:
+                    weather_loss = compute_weather_consistency_loss(hybrid_pred, weather)
                 
                 total_loss = mse_loss
                 if args.use_smoothness:
                     total_loss += args.lambda_smooth * smooth_loss
-                if args.use_peak_pattern:
-                    total_loss += args.lambda_peak * peak_loss
-                if args.use_rate_of_change:
-                    total_loss += args.lambda_roc * roc_loss
+                if args.use_temporal:
+                    total_loss += args.lambda_temporal * temporal_loss
+                if args.use_weather:
+                    total_loss += args.lambda_weather * weather_loss
                 
                 epoch_val_loss += total_loss.item()
                 epoch_val_mse += mse_loss.item()
@@ -264,12 +356,12 @@ def train_pinn(pinn, train_data, val_data, args, device):
         val_losses.append(epoch_val_loss)
         
         # Logging
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 10 == 0 or epoch == 0:
             print(f'    Epoch [{epoch+1}/{args.epochs}] '
-                  f'Train Loss: {epoch_train_loss:.6f} '
-                  f'(MSE: {epoch_train_mse:.6f}, Smooth: {epoch_train_smooth:.6f}, '
-                  f'Peak: {epoch_train_peak:.6f}, RoC: {epoch_train_roc:.6f}) '
-                  f'Val Loss: {epoch_val_loss:.6f}')
+                  f'Train: {epoch_train_loss:.6f} '
+                  f'(MSE: {epoch_train_mse:.6f}, S: {epoch_train_smooth:.6f}, '
+                  f'T: {epoch_train_temporal:.6f}, W: {epoch_train_weather:.6f}) '
+                  f'Val: {epoch_val_loss:.6f}')
         
         # Learning rate scheduling
         scheduler.step(epoch_val_loss)
@@ -278,7 +370,6 @@ def train_pinn(pinn, train_data, val_data, args, device):
         if epoch_val_loss < best_val_loss:
             best_val_loss = epoch_val_loss
             patience_counter = 0
-            # Save best model
             best_model_state = pinn.state_dict()
         else:
             patience_counter += 1
@@ -362,6 +453,10 @@ def pinn_training(args, results_path: Path):
         
         for building_name, bldg_df in dataset_generator:
             
+            # Filter to specific building if requested (for grid search)
+            if args.building_filter and building_name != args.building_filter:
+                continue
+            
             if len(bldg_df) < (args.num_training_days + 30) * 24:
                 continue
             
@@ -381,6 +476,8 @@ def pinn_training(args, results_path: Path):
             test_start_timestamp = test_set.index[0]
             test_end_timestamp = test_start_timestamp + pd.Timedelta(days=180)
             test_set = test_set[test_set.index <= test_end_timestamp]
+            
+            print(f'  Training: {len(training_set)//24} days, Test: {len(test_set)//24} days')
             
             # Train LightGBM baseline
             print('  Training LightGBM...')
@@ -458,7 +555,7 @@ def pinn_training(args, results_path: Path):
                         'max': np.max(context_window)
                     }
                     
-                    # Create a simple 24-hour LightGBM forecast
+                    # Create a 24-hour LightGBM forecast
                     lgbm_forecast_24h = []
                     last_window = values[idx-lag:idx].copy()
                     
@@ -474,6 +571,11 @@ def pinn_training(args, results_path: Path):
                     
                     lgbm_forecast_24h = np.array(lgbm_forecast_24h)
                     
+                    # Extract temperature if using weather loss
+                    temperature = None
+                    if args.use_weather:
+                        temperature = extract_temperature_from_features(exog_24h)
+                    
                     # Prepare PINN input
                     pinn_input = prepare_pinn_input(
                         lgbm_forecast_24h,
@@ -483,7 +585,7 @@ def pinn_training(args, results_path: Path):
                     )
                     
                     # Add to training or validation data
-                    data_tuple = (pinn_input, lgbm_forecast_24h, gt_24h, exog_24h)
+                    data_tuple = (pinn_input, lgbm_forecast_24h, gt_24h, temperature, exog_24h)
                     
                     if i < pinn_train_size:
                         pinn_train_data.append(data_tuple)
@@ -491,7 +593,7 @@ def pinn_training(args, results_path: Path):
                         pinn_val_data.append(data_tuple)
             
             if len(pinn_train_data) == 0 or len(pinn_val_data) == 0:
-                print('  Insufficient data for PINN training, skipping...')
+                print('  SKIP: Insufficient data for PINN training')
                 continue
             
             # Determine input dimension from first sample
@@ -511,17 +613,17 @@ def pinn_training(args, results_path: Path):
             
             # Save loss curves
             plt.figure(figsize=(10, 6))
-            plt.plot(train_losses, label='Train')
-            plt.plot(val_losses, label='Validation')
+            plt.plot(train_losses, label='Train', linewidth=2)
+            plt.plot(val_losses, label='Validation', linewidth=2)
             plt.xlabel('Epoch')
             plt.ylabel('Loss')
             plt.title(f'{dataset_name} - {building_name} - PINN Training')
             plt.legend()
-            plt.grid(True)
+            plt.grid(True, alpha=0.3)
             plt.tight_layout()
             
             safe_name = f"{dataset_name}_{building_name}".replace('/', '_').replace('\\', '_').replace(' ', '_')
-            plt.savefig(loss_curves_dir / f'{safe_name}_pinn_loss.png')
+            plt.savefig(loss_curves_dir / f'{safe_name}_pinn_loss.png', dpi=150)
             plt.close()
             
             # Evaluate on test set
@@ -532,6 +634,7 @@ def pinn_training(args, results_path: Path):
             if pred_days <= 0:
                 continue
             
+            window_count = 0
             for i in range(pred_days):
                 seq_ptr = lag + 24 * i
                 
@@ -561,6 +664,11 @@ def pinn_training(args, results_path: Path):
                     'max': np.max(last_window)
                 }
                 
+                # Extract temperature
+                temperature = None
+                if args.use_weather:
+                    temperature = extract_temperature_from_features(exog_block)
+                
                 pinn_input = prepare_pinn_input(
                     lgbm_preds,
                     exog_block,
@@ -575,14 +683,20 @@ def pinn_training(args, results_path: Path):
                 
                 hybrid_preds = lgbm_preds + residual
                 
-                # Compute physics metrics
+                # Compute physics metrics for both LightGBM and Hybrid
                 lgbm_physics = compute_physics_metrics(lgbm_preds, gt_vals)
-                hybrid_physics = compute_physics_metrics(hybrid_preds, gt_vals)
-                
+                lgbm_physics['dataset'] = dataset_name
+                lgbm_physics['building'] = building_name
+                lgbm_physics['window_idx'] = i
                 all_physics_metrics['lgbm'].append(lgbm_physics)
+                
+                hybrid_physics = compute_physics_metrics(hybrid_preds, gt_vals)
+                hybrid_physics['dataset'] = dataset_name
+                hybrid_physics['building'] = building_name
+                hybrid_physics['window_idx'] = i
                 all_physics_metrics['hybrid'].append(hybrid_physics)
                 
-                # Record metrics
+                # Record standard metrics (for hybrid only)
                 metrics_manager(
                     dataset_name,
                     f'{building_name}',
@@ -590,124 +704,136 @@ def pinn_training(args, results_path: Path):
                     torch.from_numpy(hybrid_preds).float().view(1, 24, 1),
                     building_types_mask
                 )
+                
+                window_count += 1
+            
+            print(f'  Evaluated {window_count} windows')
         
         print(f'\nDataset {dataset_name}: Processed {building_count} buildings')
     
-    # Save results
+    # ========================================
+    # Save Results
+    # ========================================
     print('\n' + '='*70)
-    print('Generating summaries...')
+    print('Saving Results...')
     print('='*70)
     
     # Model description for filename
     model_desc = 'pinn'
     if args.use_smoothness:
         model_desc += '_smooth'
-    if args.use_peak_pattern:
-        model_desc += '_peak'
-    if args.use_rate_of_change:
-        model_desc += '_roc'
-    if not (args.use_smoothness or args.use_peak_pattern or args.use_rate_of_change):
+    if args.use_temporal:
+        model_desc += '_temporal'
+    if args.use_weather:
+        model_desc += '_weather'
+    if not (args.use_smoothness or args.use_temporal or args.use_weather):
         model_desc += '_mse_only'
     
     variant_name = f'_{args.variant_name}' if args.variant_name != '' else ''
     
-    # Save standard metrics
+    # 1. Standard metrics CSV
+    print('\n1. Standard Metrics (CVRMSE, MAE)...')
     metrics_file = results_path / f'metrics_{model_desc}{variant_name}.csv'
     metrics_df = metrics_manager.summary()
     metrics_df.to_csv(metrics_file, index=False)
+    print(f'   ✅ Saved to {metrics_file}')
     
-    print(f'\n✅ Standard metrics saved to {metrics_file}')
-    print('\nStandard Metrics Summary:')
-    print(metrics_df.describe())
-    
-    # Save physics metrics
+    # 2. Aggregated physics metrics JSON
+    print('\n2. Aggregated Physics Metrics...')
     physics_summary = {}
     for key in ['lgbm', 'hybrid']:
-        metrics_list = all_physics_metrics[key]
-        if len(metrics_list) > 0:
-            physics_summary[key] = aggregate_physics_metrics(metrics_list)
+        if len(all_physics_metrics[key]) > 0:
+            physics_summary[key] = aggregate_physics_metrics(all_physics_metrics[key])
     
-    physics_file = physics_metrics_dir / f'physics_metrics_{model_desc}{variant_name}.json'
+    physics_file = physics_metrics_dir / f'physics_aggregated_{model_desc}{variant_name}.json'
     save_metrics_to_json(physics_summary, physics_file)
     
-    # Print comparison
-    if 'lgbm' in physics_summary and 'hybrid' in physics_summary:
-        print_metrics_summary(physics_summary['lgbm'], "Physics Metrics - LightGBM (within PINN run)")
+    # Print summaries
+    if 'lgbm' in physics_summary:
+        print_metrics_summary(physics_summary['lgbm'], "Physics Metrics - LightGBM Baseline")
+    if 'hybrid' in physics_summary:
         print_metrics_summary(physics_summary['hybrid'], f"Physics Metrics - {model_desc.upper()}")
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Physics-Informed Neural Network for Building Energy Forecasting')
     
-    # Data arguments
-    parser.add_argument('--results_path', type=str, default='results/pinn/')
-    parser.add_argument('--benchmark', nargs='+', type=str, default=['all'])
-    parser.add_argument('--seed', type=int, default=1)
-    parser.add_argument('--variant_name', type=str, default='')
-    parser.add_argument('--include_outliers', action='store_true')
-    parser.add_argument('--num_training_days', type=int, default=180)
-    parser.add_argument('--dont_subsample_buildings', action='store_true', default=False)
-    parser.add_argument('--use_temperature_input', action='store_true')
+    # 3. Per-building physics metrics CSV
+    print('\n3. Per-Building Physics Metrics...')
+    for key in ['lgbm', 'hybrid']:
+        if len(all_physics_metrics[key]) > 0:
+            per_building_df = create_per_building_metrics_df(all_physics_metrics[key])
+            per_building_file = physics_metrics_dir / f'physics_per_building_{key}_{model_desc}{variant_name}.csv'
+            per_building_df.to_csv(per_building_file, index=False)
+            print(f'   ✅ {key}: {per_building_file}')
+    
+    print(f'\n{"="*70}')
+    print(f'✅ Training and evaluation completed!')
+    print(f'   Total buildings processed: {total_buildings}')
+    print(f'   Results saved to: {results_path}')
+    print(f'{"="*70}')
+
+
+def main():
+    """Parse arguments and run PINN training."""
+    parser = argparse.ArgumentParser(description='PINN Building Energy Forecasting')
+    
+    # Dataset arguments
+    parser.add_argument('--benchmark', type=str, nargs='+', default=['all'],
+                        help='Benchmark dataset(s) to use')
+    parser.add_argument('--num_training_days', type=int, default=365,
+                        help='Number of days to use for training')
+    parser.add_argument('--include_outliers', action='store_true',
+                        help='Include outliers in training data')
+    parser.add_argument('--dont_subsample_buildings', action='store_true',
+                        help='Use all buildings instead of subsampling')
+    parser.add_argument('--building_filter', type=str, default='',
+                        help='Filter to specific building (for grid search)')
+    parser.add_argument('--use_temperature_input', action='store_true', default=True,
+                        help='Include temperature as input feature')
     
     # PINN architecture
-    parser.add_argument('--hidden_dims', nargs='+', type=int, default=[64, 32],
-                        help='Hidden layer dimensions')
+    parser.add_argument('--hidden_dims', type=int, nargs='+', default=[64, 32],
+                        help='Hidden layer dimensions for PINN')
     
-    # Training arguments
+    # Training hyperparameters
     parser.add_argument('--epochs', type=int, default=100,
                         help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=0.001,
-                        help='Learning rate')
+                        help='Learning rate for Adam optimizer')
     parser.add_argument('--patience', type=int, default=20,
                         help='Early stopping patience')
     
-    # Physics loss arguments
-    parser.add_argument('--use_smoothness', action='store_true',
-                        help='Use temporal smoothness loss')
+    # Physics loss flags
+    parser.add_argument('--use_smoothness', action='store_true', default=False,
+                        help='Use smoothness loss (thermal inertia)')
+    parser.add_argument('--use_temporal', action='store_true', default=False,
+                        help='Use temporal gradient loss (HVAC ramp rates)')
+    parser.add_argument('--use_weather', action='store_true', default=False,
+                        help='Use weather consistency loss')
+    
+    # Physics loss weights
     parser.add_argument('--lambda_smooth', type=float, default=0.1,
                         help='Weight for smoothness loss')
+    parser.add_argument('--lambda_temporal', type=float, default=0.1,
+                        help='Weight for temporal gradient loss')
+    parser.add_argument('--lambda_weather', type=float, default=0.1,
+                        help='Weight for weather consistency loss')
     
-    parser.add_argument('--use_peak_pattern', action='store_true',
-                        help='Use peak pattern loss')
-    parser.add_argument('--lambda_peak', type=float, default=0.05,
-                        help='Weight for peak pattern loss')
+    # Temporal gradient constraint
+    parser.add_argument('--max_gradient', type=float, default=0.3,
+                        help='Maximum allowed fractional change per hour (for temporal loss)')
     
-    parser.add_argument('--use_rate_of_change', action='store_true',
-                        help='Use rate of change loss')
-    parser.add_argument('--lambda_roc', type=float, default=0.1,
-                        help='Weight for rate of change loss')
+    # Output
+    parser.add_argument('--results_path', type=str, default='results/pinn',
+                        help='Path to save results')
+    parser.add_argument('--variant_name', type=str, default='',
+                        help='Variant name suffix for output files')
     
     args = parser.parse_args()
-    utils.set_seed(args.seed)
     
+    # Create results directory
     results_path = Path(args.results_path)
-    if args.include_outliers:
-        results_path = results_path / 'buildingsbench_with_outliers'
-    results_path.mkdir(parents=True, exist_ok=True)
     
-    # Model description
-    model_desc = 'pinn'
-    if args.use_smoothness:
-        model_desc += '_smooth'
-    if args.use_peak_pattern:
-        model_desc += '_peak'
-    if args.use_rate_of_change:
-        model_desc += '_roc'
-    if not (args.use_smoothness or args.use_peak_pattern or args.use_rate_of_change):
-        model_desc += '_mse_only'
-    
-    print('\n' + '='*70)
-    print('PHYSICS-INFORMED NEURAL NETWORK TRAINING')
-    print('='*70)
-    print(f'Configuration:')
-    print(f'  Model: {model_desc}')
-    print(f'  Hidden dims: {args.hidden_dims}')
-    print(f'  Epochs: {args.epochs}')
-    print(f'  Learning rate: {args.learning_rate}')
-    print(f'  Physics losses:')
-    print(f'    Smoothness: {args.use_smoothness} (λ={args.lambda_smooth})')
-    print(f'    Peak pattern: {args.use_peak_pattern} (λ={args.lambda_peak})')
-    print(f'    Rate of change: {args.use_rate_of_change} (λ={args.lambda_roc})')
-    print('='*70 + '\n')
-    
+    # Run training
     pinn_training(args, results_path)
+
+
+if __name__ == '__main__':
+    main()
